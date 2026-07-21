@@ -218,26 +218,106 @@ async def make_base_ctx(pw):
 
 async def scrape_ig(ctx, tag, limit=15):
     """
-    NO cookies → public hashtag feed, not your personal feed.
-    Open explore/tags/{tag} → collect reel URLs → open each reel for og:description.
-    og:description = "1.2M views · @creator: caption" — fully public.
+    Instagram recent reels via two approaches:
+    1. Primary: IG's internal API /api/v1/tags/web_info/?tag_name={tag} 
+       → returns JSON with recent media, including taken_at timestamps
+    2. Fallback: explore/tags/{tag}/?ordering=recent (requires cookies)
     """
-    rows=[]; reel_urls=[]
-    page=await ctx.new_page()
+    rows=[]
+
+    # ── Approach 1: IG GraphQL / internal API (works with sessionid cookie) ──
+    api_page=await ctx.new_page()
+    try:
+        # This endpoint returns recent posts for a hashtag as JSON
+        await api_page.goto(
+            f"https://www.instagram.com/api/v1/tags/web_info/?tag_name={tag}",
+            wait_until="domcontentloaded", timeout=20000)
+        await asyncio.sleep(2)
+        body=await api_page.content()
+        # Extract JSON from page
+        json_m=re.search(r'<pre[^>]*>(.+?)</pre>',body,re.S)
+        if not json_m: json_m=re.search(r'\{.+\}',body,re.S)
+        if json_m:
+            try:
+                import json as _json
+                data=_json.loads(json_m.group(1) if '<pre' in body else json_m.group(0))
+                # Try to get edge_hashtag_to_media or top_posts
+                edges=[]
+                for key in ['edge_hashtag_to_media','recent','top']:
+                    node=data
+                    for k in ['data',key,'edges']:
+                        if isinstance(node,dict): node=node.get(k,{})
+                    if isinstance(node,list) and node:
+                        edges=node; break
+                if edges:
+                    for edge in edges[:limit]:
+                        n=edge.get('node',edge)
+                        url=f"https://www.instagram.com/p/{n.get('shortcode','')}/"
+                        thumb=(n.get('display_url') or n.get('thumbnail_src',''))
+                        if thumb: thumb=thumb.replace('\u0026','&')
+                        ts=n.get('taken_at_timestamp') or n.get('taken_at')
+                        posted_on=datetime.fromtimestamp(int(ts)).isoformat() if ts else ''
+                        caption_edges=n.get('edge_media_to_caption',{}).get('edges',[])
+                        desc=caption_edges[0].get('node',{}).get('text','')[:200] if caption_edges else ''
+                        owner=n.get('owner',{})
+                        creator='@'+owner.get('username','') if owner.get('username') else ''
+                        views=n.get('video_view_count') or n.get('view_count')
+                        likes_n=n.get('edge_liked_by',{}).get('count') or n.get('edge_media_preview_like',{}).get('count')
+                        title=desc[:100] if desc else f"#{tag} reel"
+                        cat,vert=classify(f"{title} {desc} {tag}")
+                        rows.append({
+                            "platform":"Instagram","content_type":"Reel",
+                            "hashtag":f"#{tag}","url":url,"title":title,
+                            "description":desc,"creator":creator,"thumbnail":thumb,
+                            "posted_on":posted_on,"views":views,"likes":likes_n,
+                            "engagement":views or likes_n or 0,
+                            "category":cat,"vertical":vert,
+                            "scraped_at":datetime.now().isoformat(),
+                        })
+            except: pass
+    except: pass
+    finally:
+        try: await api_page.close()
+        except: pass
+
+    # If API gave us results, return them
+    if rows:
+        rows.sort(key=lambda x:x.get("posted_on",""),reverse=True)
+        return rows[:limit]
+
+    # ── Approach 2: explore/tags page with cookie auth ──
+    reel_urls=[]; page=await ctx.new_page()
     try:
         await page.goto(f"https://www.instagram.com/explore/tags/{tag}/",
             wait_until="domcontentloaded",timeout=25000)
         await asyncio.sleep(4)
         if "login" in page.url or "accounts" in page.url:
-            # Login wall without cookies — IG blocks this tag publicly
             return rows
-        for _ in range(4):
-            await page.evaluate("window.scrollBy(0,1200)")
-            await asyncio.sleep(0.7)
+
+        # Click Recent tab to get chronological feed
+        for recent_sel in [
+            "span:text-is('Recent')",
+            "div[role='tab']:has-text('Recent')",
+            "a[href*='recent']",
+        ]:
+            try:
+                tab=page.locator(recent_sel).first
+                if await tab.count():
+                    await tab.click()
+                    await asyncio.sleep(2.5)
+                    break
+            except: continue
+
+        for _ in range(5):
+            await page.evaluate("window.scrollBy(0,1500)")
+            await asyncio.sleep(0.8)
         links=await page.locator("a[href*='/reel/'],a[href*='/p/']").all()
-        for el in links[:limit]:
+        seen_u=set()
+        for el in links[:limit*2]:
             href=await el.get_attribute("href")
-            if href: reel_urls.append(fu("https://www.instagram.com",href))
+            if href and href not in seen_u:
+                seen_u.add(href)
+                reel_urls.append(fu("https://www.instagram.com",href))
     except: pass
     finally:
         try: await page.close()
@@ -260,7 +340,7 @@ async def scrape_ig(ctx, tag, limit=15):
                 m=re.search(pat,html,re.I)
                 if m:
                     d=m.group(1)
-                    vm=re.search(r"([\d,\.]+(?:[\s\u00a0]+(?:crore|lakh))?[KMB]?)\s*(?:views?|plays?)",d,re.I)
+                    vm=re.search(r"([\d,\.]+(?:[\s ]+(?:crore|lakh))?[KMB]?)\s*(?:views?|plays?)",d,re.I)
                     if vm: views=pn(vm.group(1).strip())
                     lm=re.search(r"([\d,\.]+[KMB]?)\s*likes?",d,re.I)
                     if lm: likes=pn(lm.group(1).strip())
@@ -268,7 +348,6 @@ async def scrape_ig(ctx, tag, limit=15):
                     if cap: desc_text=cap.group(1).strip()[:200]
                     break
 
-            # JSON fallbacks
             if not views:
                 for pat in [r'"viewCount"\s*:\s*"?([\d,]+)"?',r'"video_view_count"\s*:\s*(\d+)',r'"play_count"\s*:\s*(\d+)']:
                     m=re.search(pat,html)
@@ -277,18 +356,24 @@ async def scrape_ig(ctx, tag, limit=15):
                 m=re.search(r'"like_count"\s*:\s*(\d+)',html)
                 if m: likes=int(m.group(1))
 
-            # Creator (public JSON in page)
             m=re.search(r'"username"\s*:\s*"([^"]{2,30})"',html)
             if m: creator="@"+m.group(1)
 
-            # Posted on (timestamp)
-            m=re.search(r'"taken_at"\s*:\s*(\d+)',html)
-            if not m: m=re.search(r'"taken_at_timestamp"\s*:\s*(\d+)',html)
-            if m:
-                try: posted_on=datetime.fromtimestamp(int(m.group(1))).isoformat()
-                except: pass
+            # posted_on — multiple patterns
+            for ts_pat in [
+                r'"taken_at"\s*:\s*(\d{10})',
+                r'"taken_at_timestamp"\s*:\s*(\d{10})',
+                r'<meta[^>]+property=["\']article:published_time["\'][^>]+content=["\']([^"\']+)["\']',
+            ]:
+                m=re.search(ts_pat,html,re.I)
+                if m:
+                    val=m.group(1).strip()
+                    try:
+                        if val.isdigit(): posted_on=datetime.fromtimestamp(int(val)).isoformat()
+                        else: posted_on=datetime.fromisoformat(val.replace("Z","+00:00")).isoformat()
+                        break
+                    except: continue
 
-            # Title from <title> — strip (N) notification, strip " · Instagram"
             m=re.search(r"<title>([^<]+)</title>",html,re.I)
             if m:
                 t=m.group(1)
@@ -296,16 +381,16 @@ async def scrape_ig(ctx, tag, limit=15):
                 t=re.sub(r"\s*[•·|]\s*Instagram.*$","",t,flags=re.I).strip()
                 if len(t)>5: title=t[:200]
 
-            # Thumbnail
-            for pat in [
+            for tpat in [
                 r'<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)["\']',
                 r'og:image[^>]*content="([^"]*)"',
+                r'"thumbnail_src"\s*:\s*"([^"]+)"',
+                r'"display_url"\s*:\s*"([^"]+)"',
             ]:
-                m=re.search(pat,html,re.I)
-                if m: thumb=m.group(1); break
-            if not thumb:
-                m=re.search(r'"display_url"\s*:\s*"([^"]+)"',html)
-                if m: thumb=m.group(1).replace("\\u0026","&")
+                m=re.search(tpat,html,re.I)
+                if m:
+                    t2=m.group(1).replace("\\u0026","&")
+                    if t2.startswith("http"): thumb=t2; break
 
         except: pass
         finally:
@@ -313,35 +398,22 @@ async def scrape_ig(ctx, tag, limit=15):
             except: pass
 
         if not title: title=f"#{tag} reel"
-
-        # Skip own posts — filter by ds_user_id or username match
         own_uid=IG_SESSIONID.split("%")[0] if IG_SESSIONID else ""
         if own_uid and creator and own_uid in creator.replace("@",""):
             continue
-
-        # Skip reels older than 60 days
-        if posted_on:
-            try:
-                posted_dt=datetime.fromisoformat(posted_on)
-                if (datetime.now()-posted_dt).days > 60:
-                    continue
-            except: pass
-
-        # Classify on title + description + hashtag for better accuracy
         cat,vert=classify(f"{title} {desc_text or ''} {tag}")
         rows.append({
             "platform":"Instagram","content_type":"Reel",
-            "hashtag":f"#{tag}","url":url,
-            "title":title,"description":desc_text or "",
-            "creator":creator or "","thumbnail":thumb or "",
-            "posted_on":posted_on or "",
-            "views":views,"likes":likes,"engagement":views or likes or 0,
-            "category":cat,"vertical":vert,
+            "hashtag":f"#{tag}","url":url,"title":title,
+            "description":desc_text or "","creator":creator or "","thumbnail":thumb or "",
+            "posted_on":posted_on or "","views":views,"likes":likes,
+            "engagement":views or likes or 0,"category":cat,"vertical":vert,
             "scraped_at":datetime.now().isoformat(),
         })
 
-    rows.sort(key=lambda x:x.get("engagement") or 0,reverse=True)
-    return rows
+    rows.sort(key=lambda x:x.get("posted_on",""),reverse=True)
+    return rows[:limit]
+
 
 async def scrape_yt(ctx, tag, limit=25):
     rows=[]; page=await ctx.new_page()
