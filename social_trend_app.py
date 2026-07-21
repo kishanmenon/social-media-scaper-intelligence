@@ -304,10 +304,12 @@ async def scrape_ig(ctx, tag, limit=20):
     rows=[]; reel_urls=[]
     page=await ctx.new_page()
     try:
+        # Use cookies only if needed (login wall) — don't personalise results
         await page.goto(f"https://www.instagram.com/explore/tags/{tag}/",
             wait_until="domcontentloaded",timeout=25000)
         await asyncio.sleep(4)
         if "login" in page.url or "accounts" in page.url:
+            log.info(f"IG #{tag}: login wall even with cookies")
             return rows
         for _ in range(5):
             await page.evaluate("window.scrollBy(0,1200)")
@@ -427,29 +429,67 @@ async def get_trending_tags(ctx):
 async def _run_all(hashtags, platforms, per_tag, progress_cb):
     from playwright.async_api import async_playwright
     all_records=[]; discovered=[]
+    # Process in batches of 3 hashtags concurrently
+    BATCH = 3
+
     async with async_playwright() as pw:
         browser,ctx=await make_context(pw)
-        # Discover trending tags
-        try:
-            discovered=await get_trending_tags(ctx)
+        try: discovered=await get_trending_tags(ctx)
         except: pass
-        total=len(hashtags)
-        for i,tag in enumerate(hashtags):
-            if progress_cb: progress_cb(i/total, f"#{tag} ({i+1}/{total})")
-            if "Instagram" in platforms:
-                try:
-                    rows=await scrape_ig(ctx,tag,per_tag)
-                    all_records.extend(rows)
-                except: pass
-            if "YouTube" in platforms:
-                try:
-                    rows=await scrape_yt(ctx,tag,per_tag)
-                    all_records.extend(rows)
-                except: pass
-            await asyncio.sleep(1)
         await ctx.close()
+
+        total=len(hashtags)
+        done=0
+
+        for batch_start in range(0, total, BATCH):
+            batch=hashtags[batch_start:batch_start+BATCH]
+            tasks=[]
+            for tag in batch:
+                tasks.append(_scrape_tag(pw, tag, platforms, per_tag))
+            results=await asyncio.gather(*tasks, return_exceptions=True)
+            for r in results:
+                if isinstance(r,list): all_records.extend(r)
+            done+=len(batch)
+            if progress_cb: progress_cb(done/total, f"Done {done}/{total} hashtags")
+
         await browser.close()
-    return all_records,discovered
+    return all_records, discovered
+
+async def _scrape_tag(pw, tag, platforms, per_tag):
+    """Scrape one hashtag with its own browser context — safe for concurrent use."""
+    from playwright.async_api import async_playwright
+    rows=[]
+    args=["--disable-blink-features=AutomationControlled","--no-sandbox","--disable-gpu",
+          "--ignore-certificate-errors","--disable-dev-shm-usage","--disable-setuid-sandbox",
+          "--no-zygote","--mute-audio","--disable-extensions"]
+    try:
+        browser2=await pw.chromium.launch(headless=True,args=args)
+    except:
+        args.append("--single-process")
+        browser2=await pw.chromium.launch(headless=True,args=args)
+    ctx2=await browser2.new_context(
+        viewport={"width":1280,"height":800},
+        user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0 Safari/537.36",
+        extra_http_headers={"Accept-Language":"en-IN,en;q=0.9"})
+    await ctx2.add_init_script("Object.defineProperty(navigator,'webdriver',{get:()=>undefined});")
+    # Inject IG cookies
+    ig_cookies=[]
+    if IG_SESSIONID: ig_cookies.append({"name":"sessionid","value":IG_SESSIONID,"domain":".instagram.com","path":"/","httpOnly":True,"secure":True,"sameSite":"Lax"})
+    if IG_CSRFTOKEN: ig_cookies.append({"name":"csrftoken","value":IG_CSRFTOKEN,"domain":".instagram.com","path":"/","secure":True,"sameSite":"Lax"})
+    if ig_cookies: await ctx2.add_cookies(ig_cookies)
+    try:
+        if "Instagram" in platforms:
+            try: rows.extend(await scrape_ig(ctx2,tag,per_tag))
+            except: pass
+        if "YouTube" in platforms:
+            try: rows.extend(await scrape_yt(ctx2,tag,per_tag))
+            except: pass
+    finally:
+        try: await ctx2.close()
+        except: pass
+        try: await browser2.close()
+        except: pass
+    return rows
 
 def run_sync(hashtags,platforms,per_tag,progress_cb=None):
     result={}; exc=[]; progress_state={"frac":0,"msg":"Starting..."}
@@ -597,15 +637,15 @@ def fv(v):
     if v>=1_000: return f"{v/1_000:.0f}K"
     return str(v)
 
-def render_grid(data: pd.DataFrame, max_items: int = 40):
+def render_grid(data: pd.DataFrame, max_items: int = 40, label: str = "grid"):
     if data.empty: st.info("No posts."); return
     c1,c2,c3 = st.columns(3)
     with c1:
-        sort_opt = st.selectbox("Sort by",["Engagement","Views","Recent"], key=f"s_{id(data)}")
+        sort_opt = st.selectbox("Sort by",["Engagement","Views","Recent"], key=f"s_{label}")
     with c2:
-        plat_opt = st.selectbox("Platform",["All","Instagram","YouTube"], key=f"p_{id(data)}")
+        plat_opt = st.selectbox("Platform",["All","Instagram","YouTube"], key=f"p_{label}")
     with c3:
-        cat_opt  = st.selectbox("Category",["All"]+sorted(data["category"].unique().tolist()), key=f"c_{id(data)}")
+        cat_opt  = st.selectbox("Category",["All"]+sorted(data["category"].unique().tolist()), key=f"c_{label}")
 
     d = data.copy()
     if plat_opt!="All": d=d[d["platform"]==plat_opt]
@@ -613,14 +653,15 @@ def render_grid(data: pd.DataFrame, max_items: int = 40):
     if sort_opt=="Engagement": d=d.sort_values("engagement",ascending=False)
     elif sort_opt=="Views": d=d.sort_values("views",ascending=False,na_position="last")
     elif sort_opt=="Recent": d=d.sort_values("scraped_at",ascending=False)
-    d=d.head(max_items)
+    d=d.head(max_items).reset_index(drop=True)
 
     st.caption(f"{len(d)} posts · sort: {sort_opt}")
     rows_of_4 = [d.iloc[i:i+4] for i in range(0,len(d),4)]
-    for row in rows_of_4:
+    for row_idx, row in enumerate(rows_of_4):
         cols=st.columns(4)
-        for col,(_,r) in zip(cols,row.iterrows()):
-            with col:
+        for col_idx,(df_idx, r) in zip(range(4), row.iterrows()):
+            with cols[col_idx]:
+                i2 = row_idx * 4 + col_idx  # unique index within this grid
                 plat  = r.get("platform","")
                 url   = r.get("url","#") or "#"
                 thumb = r.get("thumbnail","")
@@ -647,7 +688,6 @@ def render_grid(data: pd.DataFrame, max_items: int = 40):
                     f'border-radius:8px;font-size:10px">{ht}</span>',
                     unsafe_allow_html=True)
                 st.markdown(f"**{title}**")
-                if cr: st.caption(cr)
                 metric = "  ·  ".join(filter(None,[
                     f"👁 {fv(views)}" if views and not pd.isna(views) else None,
                     f"❤️ {fv(likes)}" if likes and not pd.isna(likes) else None,
@@ -655,16 +695,17 @@ def render_grid(data: pd.DataFrame, max_items: int = 40):
                 st.caption(f"{metric}")
                 st.caption(f"🏷 {cat}")
 
-                # Open + embed buttons
                 bc1,bc2 = st.columns(2)
                 with bc1:
                     st.link_button("Open", url, use_container_width=True)
                 with bc2:
-                    key = f"e_{hash(url)}"
-                    if st.button("▶", key=key, use_container_width=True):
-                        st.session_state[key+"_show"] = not st.session_state.get(key+"_show",False)
+                    btn_key = f"play_{label}_{i2}"
+                    if st.button("▶", key=btn_key, use_container_width=True):
+                        show_key = btn_key+"_show"
+                        st.session_state[show_key] = not st.session_state.get(show_key,False)
 
-                if st.session_state.get(f"e_{hash(url)}_show",False):
+                show_key = f"play_{label}_{i2}_show"
+                if st.session_state.get(show_key,False):
                     if plat=="YouTube":
                         vid_m=re.search(r"(?:v=|/shorts/)([A-Za-z0-9_-]{11})",url)
                         if vid_m:
@@ -672,8 +713,8 @@ def render_grid(data: pd.DataFrame, max_items: int = 40):
                         else:
                             st.link_button("Watch on YouTube", url)
                     elif plat=="Instagram":
-                        clean=url.split("?")[0].rstrip("/")
                         st.markdown(f'<blockquote class="instagram-media" data-instgrm-permalink="{url}" data-instgrm-version="14" style="width:100%!important;min-width:200px"></blockquote><script async src="//www.instagram.com/embed.js"></script>', unsafe_allow_html=True)
+
 
 # ── TABS ──────────────────────────────────────────────────────────────────────
 now = datetime.now()
@@ -685,17 +726,17 @@ t30,t7,tod,top20,stats = st.tabs([
 with t30:
     st.subheader("Last 30 Days")
     d30 = df[df["scraped_at"] >= now-timedelta(days=30)]
-    render_grid(d30, 60)
+    render_grid(d30, 60, "l30")
 
 with t7:
     st.subheader("Last 7 Days")
     d7 = df[df["scraped_at"] >= now-timedelta(days=7)]
-    render_grid(d7, 40)
+    render_grid(d7, 40, "l7")
 
 with tod:
     st.subheader("Today & Yesterday")
     dt = df[df["scraped_at"] >= now-timedelta(days=2)]
-    render_grid(dt, 30)
+    render_grid(dt, 30, "today")
 
 with top20:
     st.subheader("🏆 Lifetime Top 20 by Engagement")
@@ -780,3 +821,18 @@ with stats:
         AvgEng=("engagement","mean"),
     ).round(0).sort_values("TotalEng",ascending=False).reset_index()
     st.dataframe(hs, use_container_width=True)
+
+    st.divider()
+    st.markdown("#### 🔥 Google Trending India (Live)")
+    try:
+        import requests as _req
+        r = _req.get("https://trends.google.com/trending/rss?geo=IN", timeout=8)
+        trending_items = re.findall(r"<title><!\[CDATA\[(.+?)\]\]></title>|<title>(.+?)</title>", r.text)[1:21]
+        chips = " ".join(
+            f'<span style="display:inline-block;background:#f0f4ff;color:#4361ee;padding:5px 12px;border-radius:20px;font-size:12px;margin:3px;font-weight:500">{(g1 or g2).strip()}</span>'
+            for g1,g2 in trending_items if (g1 or g2).strip()
+        )
+        if chips: st.markdown(chips, unsafe_allow_html=True)
+        else: st.info("No trending data available.")
+    except Exception as e:
+        st.info(f"Could not fetch Google Trends: {e}")
