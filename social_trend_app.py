@@ -493,6 +493,7 @@ if "init" not in st.session_state:
     st.session_state.sel_tags=BASE_TAGS[:10]
     st.session_state.sel_plats=["Instagram","YouTube"]
     st.session_state.per_tag=10
+    st.session_state.sort_mode="Engagement ↓"
     st.session_state.playing=None   # card_id currently playing
 
 # ── STYLES ────────────────────────────────────────────────────────────────────
@@ -537,10 +538,17 @@ with st.sidebar:
     new_p=st.multiselect("Platforms",["Instagram","YouTube"],default=st.session_state.sel_plats,key="pp")
     if new_p!=st.session_state.sel_plats: st.session_state.sel_plats=new_p
     new_n=st.slider("Posts per hashtag per platform",5,30,st.session_state.per_tag,key="pn")
-    st.caption(f"= up to {new_n * len(st.session_state.sel_plats)} posts per hashtag")
+    st.caption(f"≈ {new_n} IG + {new_n} YT per hashtag")
     if new_n!=st.session_state.per_tag: st.session_state.per_tag=new_n
     st.divider()
-    scrape_btn=st.button("🚀 Scrape",type="primary",use_container_width=True)
+    new_sort=st.radio("Sort / Rank by",
+        ["Engagement ↓","Recency × Engagement","Most Recent ↓"],
+        index=["Engagement ↓","Recency × Engagement","Most Recent ↓"].index(st.session_state.get("sort_mode","Engagement ↓")),
+        key="sort_radio")
+    if new_sort!=st.session_state.get("sort_mode"): st.session_state.sort_mode=new_sort
+    st.caption("Recency × Eng = L30d ranked by decay-weighted engagement")
+    st.divider()
+    scrape_btn=st.button("🚀 Scrape Now",type="primary",use_container_width=True)
     st.divider()
     all_db=load_data()
     st.metric("Stored",len(all_db))
@@ -552,6 +560,7 @@ with st.sidebar:
 sel_tags=st.session_state.sel_tags
 sel_plats=st.session_state.sel_plats
 per_n=st.session_state.per_tag
+sort_mode=st.session_state.get("sort_mode","Engagement ↓")
 
 # ── SCRAPE ─────────────────────────────────────────────────────────────────────
 if scrape_btn and sel_tags:
@@ -608,30 +617,27 @@ if df_sel.empty:
 if "uploaded_at" not in df_sel.columns:
     df_sel["uploaded_at"]=pd.to_datetime(df_sel.get("posted_on",""),errors="coerce")
 
-# ── GLOBAL FILTER BAR (persistent) ───────────────────────────────────────────
+# ── VIEW FILTERS (category/vertical only — platform comes from sidebar) ───────
 st.markdown("---")
-fc1,fc2,fc3=st.columns(3)
+fc1,fc2=st.columns(2)
 with fc1:
-    pf=st.multiselect("Platform",sorted(df_sel["platform"].unique()),
-        default=list(sorted(df_sel["platform"].unique())),key="gfp")
+    cat_opts=["All"]+sorted(df_sel["category"].unique())
+    cf_val=st.selectbox("Filter by Category",cat_opts,key="gfc")
 with fc2:
-    cat_opts=sorted(df_sel["category"].unique())
-    cf=st.multiselect("Category",cat_opts,key="gfc")
-with fc3:
-    vert_opts=sorted(df_sel["vertical"].unique())
-    vf=st.multiselect("Vertical",vert_opts,key="gfv")
+    vert_opts=["All"]+sorted(df_sel["vertical"].unique())
+    vf_val=st.selectbox("Filter by Vertical",vert_opts,key="gfv")
 
 dff=df_sel.copy()
-if pf: dff=dff[dff["platform"].isin(pf)]
-if cf: dff=dff[dff["category"].isin(cf)]
-if vf: dff=dff[dff["vertical"].isin(vf)]
+# Platform filter = sidebar sel_plats (single source of truth)
+if sel_plats: dff=dff[dff["platform"].isin(sel_plats)]
+if cf_val!="All": dff=dff[dff["category"]==cf_val]
+if vf_val!="All": dff=dff[dff["vertical"]==vf_val]
 if "uploaded_at" not in dff.columns:
     dff["uploaded_at"]=pd.to_datetime(dff.get("posted_on",""),errors="coerce")
 
 # Export
 csv_b=io.StringIO(); dff.to_csv(csv_b,index=False)
 st.download_button("⬇️ Export CSV",csv_b.getvalue(),"trends.csv","text/csv")
-
 if dff.empty: st.info("No data matches filters."); st.stop()
 
 # ── HELPERS ───────────────────────────────────────────────────────────────────
@@ -641,6 +647,27 @@ def fv(v):
     if v>=1_000_000: return f"{v/1_000_000:.1f}M"
     if v>=1_000: return f"{v/1_000:.0f}K"
     return str(v)
+
+def recency_x_eng(data:pd.DataFrame)->pd.DataFrame:
+    import numpy as np
+    d=data.copy()
+    ref_col="uploaded_at" if ("uploaded_at" in d.columns and d["uploaded_at"].notna().any()) else "scraped_at"
+    ref=pd.to_datetime(d[ref_col],errors="coerce")
+    now_ts=pd.Timestamp.now()
+    age_days=((now_ts-ref).dt.total_seconds()/86400).fillna(30).clip(0,365)
+    eng=pd.to_numeric(d["engagement"],errors="coerce").fillna(0)
+    d["_score"]=eng*np.exp(-age_days/7)
+    return d.sort_values("_score",ascending=False).drop(columns=["_score"])
+
+def apply_sort(d:pd.DataFrame)->pd.DataFrame:
+    srt=st.session_state.get("sort_mode","Engagement ↓")
+    if srt=="Engagement ↓":
+        return d.sort_values("engagement",ascending=False)
+    elif srt=="Recency × Engagement":
+        return recency_x_eng(d)
+    else:  # Most Recent ↓
+        rc="uploaded_at" if ("uploaded_at" in d.columns and d["uploaded_at"].notna().any()) else "scraped_at"
+        return d.sort_values(rc,ascending=False,na_position="last")
 
 def render_card(r:dict, card_id:str):
     plat =r.get("platform",""); ctype=r.get("content_type","")
@@ -695,7 +722,7 @@ def render_card(r:dict, card_id:str):
         f"👁 {fv(views)}" if views and not pd.isna(views) else None,
         f"❤️ {fv(likes)}" if likes and not pd.isna(likes) else None,
     ])) or f"Eng: {fv(eng)}"
-    posted_line=f'<div class="cm">🕐 {posted}</div>' if posted else ""
+    posted_line=f'<div class="cm">🕐 {posted[:10] if posted else ""}</div>' if posted else ""
     cat_v=f'{cat}{" · "+vert if vert and vert!="Other" else ""}'
     st.markdown(f"""<div class="cb">
 <div>{pb} {ht_b}</div>
@@ -708,15 +735,128 @@ def render_card(r:dict, card_id:str):
 </div>""",unsafe_allow_html=True)
     st.link_button("Open ↗",url,use_container_width=True)
 
-def recency_x_eng(data:pd.DataFrame)->pd.DataFrame:
-    """Score = engagement * recency_decay. Half-life = 7 days."""
-    import numpy as np
+def render_grid(data:pd.DataFrame, label:str, max_n:int=50, ct_filter:str="All"):
+    """Render grid. Sort comes from sidebar sort_mode. ct_filter = content type sub-filter."""
+    if data.empty:
+        st.info("No posts for this view."); return
     d=data.copy()
-    ref_col="uploaded_at" if ("uploaded_at" in d.columns and d["uploaded_at"].notna().any()) else "scraped_at"
-    ref=pd.to_datetime(d[ref_col],errors="coerce")
-    now_ts=pd.Timestamp.now()
-    # Pure pandas timedelta — no float mixing
-    age_days=((now_ts - ref).dt.total_seconds() / 86400).fillna(30).clip(0,365)
-    eng=pd.to_numeric(d["engagement"],errors="coerce").fillna(0)
-    d["_score"]=eng * np.exp(-age_days/7)
-    return d.sort_values("_score",ascending=False).drop(columns=["_score"])
+    # Content-type sub-filter
+    if ct_filter=="Shorts":
+        d=d[d["content_type"]=="Shorts"] if "content_type" in d.columns else d
+    elif ct_filter=="Videos":
+        d=d[(d["platform"]=="YouTube")&(d["content_type"]!="Shorts")] if "content_type" in d.columns else d
+    elif ct_filter=="Instagram":
+        d=d[d["platform"]=="Instagram"]
+    elif ct_filter=="YouTube":
+        d=d[d["platform"]=="YouTube"]
+    d=apply_sort(d).head(max_n).reset_index(drop=True)
+    ig_n=len(d[d["platform"]=="Instagram"])
+    yt_n=len(d[d["platform"]=="YouTube"])
+    sh_n=len(d[d["content_type"]=="Shorts"]) if "content_type" in d.columns else 0
+    srt=st.session_state.get("sort_mode","Engagement ↓")
+    st.caption(f"**{len(d)} posts** · IG:{ig_n} · YT:{yt_n} (Shorts:{sh_n}) · sort: {srt}")
+    for i in range(0,len(d),4):
+        cols=st.columns(4)
+        for j,(_,r) in enumerate(d.iloc[i:i+4].iterrows()):
+            with cols[j]:
+                render_card(r.to_dict(),f"{label}_{i+j}")
+
+# ── TABS ──────────────────────────────────────────────────────────────────────
+now=datetime.now()
+ua=dff["uploaded_at"] if "uploaded_at" in dff.columns else pd.Series([pd.NaT]*len(dff))
+ua=pd.to_datetime(ua,errors="coerce")
+d30=dff[ua.notna()&(ua>=now-timedelta(days=30))]
+d7 =dff[ua.notna()&(ua>=now-timedelta(days=7))]
+d1 =dff[ua.notna()&(ua>=now-timedelta(days=1))]
+dall=dff
+
+t_l30,t_l7,t_l1,t_all,t_gt,t_stats=st.tabs([
+    f"📅 L30 Days ({len(d30)})",
+    f"📅 L7 Days ({len(d7)})",
+    f"📅 Last 24h ({len(d1)})",
+    f"🏆 Lifetime ({len(dall)})",
+    "🔥 Google Trends",
+    "📊 Stats",
+])
+
+with t_l30:
+    st.caption(f"Reels/videos **uploaded** in last 30 days · {len(d30)} of {len(dff)} total · platforms: {', '.join(sel_plats)}")
+    render_grid(d30,"l30",60)
+
+with t_l7:
+    st.caption(f"Reels/videos **uploaded** in last 7 days · {len(d7)} of {len(dff)} total")
+    render_grid(d7,"l7",40)
+
+with t_l1:
+    st.caption(f"Reels/videos **uploaded** in last 24h · {len(d1)} of {len(dff)} total")
+    render_grid(d1,"l1d",30)
+
+with t_all:
+    st.subheader("🏆 Lifetime · All Scraped Content")
+    sub_tabs=st.tabs(["All","Instagram Reels","YT Videos","YT Shorts"])
+    with sub_tabs[0]: render_grid(dall,"life_all",80,"All")
+    with sub_tabs[1]: render_grid(dall,"life_ig",40,"Instagram")
+    with sub_tabs[2]: render_grid(dall,"life_ytv",40,"Videos")
+    with sub_tabs[3]: render_grid(dall,"life_yts",40,"Shorts")
+
+with t_gt:
+    st.subheader("🔥 Google Trends India")
+    if trends_live:
+        st.markdown("##### Live Right Now")
+        chips=" ".join(f'<span class="tc">{t["topic"]}<span class="tv"> {t["vol"]}/day</span></span>' for t in trends_live)
+        st.markdown(chips,unsafe_allow_html=True)
+        st.divider()
+    history=load_trends_history()
+    if history:
+        h_df=pd.DataFrame([
+            {"topic":item["topic"],"vol":item.get("vol",""),
+             "fetched_at":pd.to_datetime(snap["fetched_at"])}
+            for snap in history for item in snap.get("items",[])
+        ])
+        h_df["fetched_at"]=pd.to_datetime(h_df["fetched_at"],errors="coerce")
+        gt1,gt2,gt3=st.tabs(["Last 30 Days","Last 7 Days","Last 24h"])
+        for tab,days,lbl in [(gt1,30,"L30"),(gt2,7,"L7"),(gt3,1,"L1")]:
+            with tab:
+                sub=h_df[h_df["fetched_at"]>=now-timedelta(days=days)]
+                if sub.empty:
+                    st.info(f"No trend history for {lbl} yet — builds up over time.")
+                else:
+                    freq=sub.groupby("topic").size().reset_index(name="times").sort_values("times",ascending=False)
+                    st.markdown(f"**{len(freq)} topics** trended in this window")
+                    st.markdown(" ".join(f'<span class="tc">{r["topic"]}<span class="tv"> ×{r["times"]}</span></span>' for _,r in freq.head(30).iterrows()),unsafe_allow_html=True)
+    else:
+        st.info("Trend history builds up as the app is used. Check back after a few sessions.")
+
+with t_stats:
+    st.subheader("📊 Stats")
+    m1,m2,m3,m4=st.columns(4)
+    with m1: st.metric("Total",len(dff))
+    with m2: st.metric("Instagram",len(dff[dff["platform"]=="Instagram"]))
+    with m3: st.metric("YouTube",len(dff[dff["platform"]=="YouTube"]))
+    with m4: st.metric("Categories",dff["category"].nunique())
+    st.divider()
+    ch1,ch2=st.columns(2)
+    with ch1:
+        st.markdown("#### Top Categories")
+        cc=dff["category"].value_counts().head(15).reset_index()
+        cc.columns=["Category","Count"]
+        cc["Category"]=cc["Category"].str.replace("Shopsy","")
+        st.bar_chart(cc.set_index("Category")["Count"])
+    with ch2:
+        st.markdown("#### Vertical Engagement")
+        ve=dff.groupby("vertical")["engagement"].sum().sort_values(ascending=False).reset_index()
+        st.bar_chart(ve.set_index("vertical")["engagement"])
+    yt2=dff[dff["platform"]=="YouTube"]
+    if not yt2.empty and "content_type" in yt2.columns:
+        st.divider()
+        ct2=yt2["content_type"].value_counts().reset_index(); ct2.columns=["Type","Count"]
+        st.markdown("#### YouTube: Videos vs Shorts")
+        st.bar_chart(ct2.set_index("Type")["Count"])
+    st.divider()
+    st.markdown("#### Hashtag Performance")
+    hs=dff.groupby("hashtag").agg(Posts=("url","count"),TotalEng=("engagement","sum"),AvgEng=("engagement","mean")).round(0).sort_values("TotalEng",ascending=False).reset_index()
+    st.dataframe(hs,use_container_width=True)
+    st.divider()
+    st.markdown("#### Full Data")
+    dc=[c for c in ["platform","content_type","hashtag","title","creator","views","likes","engagement","category","vertical","posted_on","url"] if c in dff.columns]
+    st.dataframe(dff[dc],use_container_width=True,height=350)
