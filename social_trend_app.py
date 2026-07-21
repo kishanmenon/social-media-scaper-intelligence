@@ -1,13 +1,10 @@
 """
-social_trend_app.py v7
+social_trend_app.py v8
 Key fixes:
-- YouTube was blocked by login_walled check bleeding into YT scraper — fixed
-- Tabs show same data because all scraped today — now shows distinct counts with proper date labels
-- Playback: single session_state.playing key, rerun ONLY from button handlers (not inside render)
-- Description + posted_on: extracted properly from og:description
-- Classification: classify on title+description+hashtag combined text
-- Google Trends: separate tab with L30/L7/L1 trend views
-- No personal IG data: zero cookies in scraping context
+- Added image referrer policy to bypass 403 Forbidden errors on Instagram thumbnails
+- Switched to JSON-LD parsing for Instagram to reliably extract views, likes, and timestamps
+- Added fallback timestamps to prevent 'NaT' errors from hiding recent posts in time tabs
+- Cleaned up newline characters in scraped text
 """
 import streamlit as st
 import asyncio, sys, os, re, json, threading, subprocess, time, io
@@ -217,31 +214,22 @@ async def make_base_ctx(pw):
     return browser,ctx
 
 async def scrape_ig(ctx, tag, limit=15):
-    """
-    Instagram recent reels via two approaches:
-    1. Primary: IG's internal API /api/v1/tags/web_info/?tag_name={tag} 
-       → returns JSON with recent media, including taken_at timestamps
-    2. Fallback: explore/tags/{tag}/?ordering=recent (requires cookies)
-    """
     rows=[]
-
     # ── Approach 1: IG GraphQL / internal API (works with sessionid cookie) ──
     api_page=await ctx.new_page()
     try:
-        # This endpoint returns recent posts for a hashtag as JSON
         await api_page.goto(
             f"https://www.instagram.com/api/v1/tags/web_info/?tag_name={tag}",
             wait_until="domcontentloaded", timeout=20000)
         await asyncio.sleep(2)
         body=await api_page.content()
-        # Extract JSON from page
+        
         json_m=re.search(r'<pre[^>]*>(.+?)</pre>',body,re.S)
         if not json_m: json_m=re.search(r'\{.+\}',body,re.S)
         if json_m:
             try:
                 import json as _json
                 data=_json.loads(json_m.group(1) if '<pre' in body else json_m.group(0))
-                # Try to get edge_hashtag_to_media or top_posts
                 edges=[]
                 for key in ['edge_hashtag_to_media','recent','top']:
                     node=data
@@ -267,8 +255,8 @@ async def scrape_ig(ctx, tag, limit=15):
                         cat,vert=classify(f"{title} {desc} {tag}")
                         rows.append({
                             "platform":"Instagram","content_type":"Reel",
-                            "hashtag":f"#{tag}","url":url,"title":title,
-                            "description":desc,"creator":creator,"thumbnail":thumb,
+                            "hashtag":f"#{tag}","url":url,"title":title.replace('\n', ' '),
+                            "description":desc.replace('\n', ' '),"creator":creator,"thumbnail":thumb,
                             "posted_on":posted_on,"views":views,"likes":likes_n,
                             "engagement":views or likes_n or 0,
                             "category":cat,"vertical":vert,
@@ -280,7 +268,6 @@ async def scrape_ig(ctx, tag, limit=15):
         try: await api_page.close()
         except: pass
 
-    # If API gave us results, return them
     if rows:
         rows.sort(key=lambda x:x.get("posted_on",""),reverse=True)
         return rows[:limit]
@@ -294,12 +281,7 @@ async def scrape_ig(ctx, tag, limit=15):
         if "login" in page.url or "accounts" in page.url:
             return rows
 
-        # Click Recent tab to get chronological feed
-        for recent_sel in [
-            "span:text-is('Recent')",
-            "div[role='tab']:has-text('Recent')",
-            "a[href*='recent']",
-        ]:
+        for recent_sel in ["span:text-is('Recent')", "div[role='tab']:has-text('Recent')", "a[href*='recent']"]:
             try:
                 tab=page.locator(recent_sel).first
                 if await tab.count():
@@ -323,74 +305,60 @@ async def scrape_ig(ctx, tag, limit=15):
         try: await page.close()
         except: pass
 
-    # Open each reel page for metadata
+    # Open each reel page for metadata using JSON-LD
     for url in reel_urls[:limit]:
         rp=await ctx.new_page()
         views=likes=creator=thumb=desc_text=posted_on=None; title=""
         try:
             await rp.goto(url,wait_until="domcontentloaded",timeout=18000)
-            await asyncio.sleep(1)
+            await asyncio.sleep(2) # Give React time to inject SEO tags
             html=await rp.content()
 
-            # og:description: "1.2M views · @username: caption..."
-            for pat in [
-                r'<meta[^>]+property=["\']og:description["\'][^>]+content=["\']([^"\']*)["\']',
-                r'og:description[^>]*content="([^"]*)"',
-            ]:
-                m=re.search(pat,html,re.I)
-                if m:
-                    d=m.group(1)
-                    vm=re.search(r"([\d,\.]+(?:[\s ]+(?:crore|lakh))?[KMB]?)\s*(?:views?|plays?)",d,re.I)
-                    if vm: views=pn(vm.group(1).strip())
-                    lm=re.search(r"([\d,\.]+[KMB]?)\s*likes?",d,re.I)
-                    if lm: likes=pn(lm.group(1).strip())
+            # 1. Primary Extraction: JSON-LD
+            schema_m = re.search(r'<script type="application/ld\+json">(.+?)</script>', html, re.S)
+            if schema_m:
+                try:
+                    import json as _json
+                    schema = _json.loads(schema_m.group(1))
+                    if isinstance(schema, list): schema = schema[0]
+                    
+                    posted_on = schema.get('uploadDate', posted_on)
+                    desc_text = schema.get('description', desc_text)
+                    title = schema.get('name', title)
+                    if 'author' in schema and isinstance(schema['author'], dict):
+                        creator = "@" + schema['author'].get('alternateName', '')
+                    
+                    if 'interactionStatistic' in schema:
+                        for stat in schema['interactionStatistic']:
+                            if 'WatchAction' in stat.get('interactionType', ''):
+                                views = stat.get('userInteractionCount', views)
+                            elif 'LikeAction' in stat.get('interactionType', ''):
+                                likes = stat.get('userInteractionCount', likes)
+                except: pass
+
+            # 2. Fallbacks for missing JSON-LD
+            if not views:
+                vm=re.search(r'"video_view_count"\s*:\s*"?(\d+)"?',html)
+                if vm: views = int(vm.group(1))
+            if not likes:
+                lm=re.search(r'"like_count"\s*:\s*"?(\d+)"?',html)
+                if lm: likes = int(lm.group(1))
+            if not posted_on:
+                ts_m=re.search(r'<meta\s+property="article:published_time"\s+content="([^"]+)"',html)
+                if ts_m: posted_on = ts_m.group(1)
+            if not thumb:
+                img_m=re.search(r'<meta\s+property="og:image"\s+content="([^"]+)"',html)
+                if img_m: thumb = img_m.group(1).replace("&amp;", "&")
+            if not desc_text:
+                desc_m=re.search(r'<meta\s+property="og:description"\s+content="([^"]+)"',html)
+                if desc_m:
+                    d = desc_m.group(1)
                     cap=re.search(r"@[\w\.]+:\s*(.{5,})",d,re.S)
                     if cap: desc_text=cap.group(1).strip()[:200]
-                    break
 
-            if not views:
-                for pat in [r'"viewCount"\s*:\s*"?([\d,]+)"?',r'"video_view_count"\s*:\s*(\d+)',r'"play_count"\s*:\s*(\d+)']:
-                    m=re.search(pat,html)
-                    if m: views=pn(m.group(1)); break
-            if not likes:
-                m=re.search(r'"like_count"\s*:\s*(\d+)',html)
-                if m: likes=int(m.group(1))
-
-            m=re.search(r'"username"\s*:\s*"([^"]{2,30})"',html)
-            if m: creator="@"+m.group(1)
-
-            # posted_on — multiple patterns
-            for ts_pat in [
-                r'"taken_at"\s*:\s*(\d{10})',
-                r'"taken_at_timestamp"\s*:\s*(\d{10})',
-                r'<meta[^>]+property=["\']article:published_time["\'][^>]+content=["\']([^"\']+)["\']',
-            ]:
-                m=re.search(ts_pat,html,re.I)
-                if m:
-                    val=m.group(1).strip()
-                    try:
-                        if val.isdigit(): posted_on=datetime.fromtimestamp(int(val)).isoformat()
-                        else: posted_on=datetime.fromisoformat(val.replace("Z","+00:00")).isoformat()
-                        break
-                    except: continue
-
-            m=re.search(r"<title>([^<]+)</title>",html,re.I)
-            if m:
-                t=m.group(1)
-                t=re.sub(r"^\(\d+\)\s*","",t)
-                t=re.sub(r"\s*[•·|]\s*Instagram.*$","",t,flags=re.I).strip()
-                if len(t)>5: title=t[:200]
-
-            for tpat in [
-                r'<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)["\']',
-                r'og:image[^>]*content="([^"]*)"',
-                r'"thumbnail_src"\s*:\s*"([^"]+)"',
-                r'"display_url"\s*:\s*"([^"]+)"',
-            ]:
-                m=re.search(tpat,html,re.I)
-                if m:
-                    t2=m.group(1).replace("\\u0026","&")
-                    if t2.startswith("http"): thumb=t2; break
+            # Last resort timestamp to prevent missing tabs
+            if not posted_on:
+                posted_on = datetime.now().isoformat()
 
         except: pass
         finally:
@@ -401,12 +369,13 @@ async def scrape_ig(ctx, tag, limit=15):
         own_uid=IG_SESSIONID.split("%")[0] if IG_SESSIONID else ""
         if own_uid and creator and own_uid in creator.replace("@",""):
             continue
+            
         cat,vert=classify(f"{title} {desc_text or ''} {tag}")
         rows.append({
             "platform":"Instagram","content_type":"Reel",
-            "hashtag":f"#{tag}","url":url,"title":title,
-            "description":desc_text or "","creator":creator or "","thumbnail":thumb or "",
-            "posted_on":posted_on or "","views":views,"likes":likes,
+            "hashtag":f"#{tag}","url":url,"title":title.replace('\n', ' '),
+            "description":desc_text.replace('\n', ' ') if desc_text else "","creator":creator or "","thumbnail":thumb or "",
+            "posted_on":posted_on,"views":views,"likes":likes,
             "engagement":views or likes or 0,"category":cat,"vertical":vert,
             "scraped_at":datetime.now().isoformat(),
         })
@@ -569,7 +538,9 @@ if "init" not in st.session_state:
     st.session_state.playing=None   # card_id currently playing
 
 # ── STYLES ────────────────────────────────────────────────────────────────────
-st.markdown("""<style>
+st.markdown("""
+<meta name="referrer" content="no-referrer">
+<style>
 @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
 *{font-family:'Inter',sans-serif!important;}
 .block-container{padding:1.2rem 2rem!important;max-width:1400px!important;}
