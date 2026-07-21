@@ -1,5 +1,5 @@
 """
-social_trend_app.py
+social_trend_app.py \u2014 Final
 ============================
 - IG + YouTube reels/videos with thumbnails + in-app playback
 - Shopsy category classification (26 categories)
@@ -507,8 +507,10 @@ st.markdown("""
 
 # Cookie status
 has_ig = bool(IG_SESSIONID)
+_ig_bg = '#22c55e' if has_ig else '#f59e0b'
+_ig_msg = '✅ IG cookies active' if has_ig else '⚠️ IG cookies not set — add in Secrets'
 st.markdown(
-    f'<span style="background:{"#22c55e" if has_ig else "#f59e0b"};color:#fff;padding:3px 10px;border-radius:20px;font-size:11px;font-weight:600">{"\u2705 IG cookies active" if has_ig else "\u26a0\ufe0f IG cookies not set \u2014 add in Secrets"}</span>',
+    f'<span style="background:{_ig_bg};color:#fff;padding:3px 10px;border-radius:20px;font-size:11px;font-weight:600">{_ig_msg}</span>',
     unsafe_allow_html=True)
 
 # \u2500\u2500 SIDEBAR \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
