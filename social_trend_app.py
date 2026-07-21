@@ -514,7 +514,8 @@ with st.sidebar:
             st.rerun()
     new_p=st.multiselect("Platforms",["Instagram","YouTube"],default=st.session_state.sel_plats,key="pp")
     if new_p!=st.session_state.sel_plats: st.session_state.sel_plats=new_p
-    new_n=st.slider("Posts/hashtag",5,20,st.session_state.per_tag,key="pn")
+    new_n=st.slider("Posts per hashtag per platform",5,30,st.session_state.per_tag,key="pn")
+    st.caption(f"= up to {new_n * len(st.session_state.sel_plats)} posts per hashtag")
     if new_n!=st.session_state.per_tag: st.session_state.per_tag=new_n
     st.divider()
     scrape_btn=st.button("🚀 Scrape",type="primary",use_container_width=True)
@@ -570,8 +571,10 @@ if "vertical" not in df.columns: df["vertical"]="Other"
 if "content_type" not in df.columns: df["content_type"]=""
 if "posted_on" not in df.columns: df["posted_on"]=""
 # Parse posted_on to datetime for tab filtering (falls back to scraped_at if missing)
+# uploaded_at = actual reel upload date (from og: or taken_at)
+# NO fallback to scraped_at — if we don't know when it was posted, don't show in time tabs
 df["uploaded_at"]=pd.to_datetime(df["posted_on"],errors="coerce")
-df["uploaded_at"]=df["uploaded_at"].fillna(df["scraped_at"])  # fallback
+# scraped_at is kept separately for "all time" / lifetime tab
 if "vid_id" not in df.columns: df["vid_id"]=""
 
 # Filter to selected hashtags only
@@ -581,7 +584,7 @@ if df_sel.empty:
     df_sel=df.copy()
 # Ensure uploaded_at is in df_sel
 if "uploaded_at" not in df_sel.columns:
-    df_sel["uploaded_at"]=pd.to_datetime(df_sel.get("posted_on",""),errors="coerce").fillna(df_sel["scraped_at"])
+    df_sel["uploaded_at"]=pd.to_datetime(df_sel.get("posted_on",""),errors="coerce")
 
 # ── GLOBAL FILTER BAR (persistent) ───────────────────────────────────────────
 st.markdown("---")
@@ -601,7 +604,7 @@ if pf: dff=dff[dff["platform"].isin(pf)]
 if cf: dff=dff[dff["category"].isin(cf)]
 if vf: dff=dff[dff["vertical"].isin(vf)]
 if "uploaded_at" not in dff.columns:
-    dff["uploaded_at"]=pd.to_datetime(dff.get("posted_on",""),errors="coerce").fillna(dff["scraped_at"])
+    dff["uploaded_at"]=pd.to_datetime(dff.get("posted_on",""),errors="coerce")
 
 # Export
 csv_b=io.StringIO(); dff.to_csv(csv_b,index=False)
@@ -683,108 +686,115 @@ def render_card(r:dict, card_id:str):
 </div>""",unsafe_allow_html=True)
     st.link_button("Open ↗",url,use_container_width=True)
 
+def recency_x_eng(d):
+    import numpy as np
+    now_ts=datetime.now().timestamp()
+    d=d.copy()
+    ref=d["uploaded_at"] if "uploaded_at" in d.columns else d["scraped_at"]
+    def to_ts(x):
+        try: return x.timestamp()
+        except: return now_ts
+    age_days=(now_ts - ref.apply(to_ts)) / 86400
+    eng=pd.to_numeric(d["engagement"],errors="coerce").fillna(0)
+    d["_score"]=eng * np.exp(-age_days.clip(0,365)/7)
+    return d.sort_values("_score",ascending=False).drop(columns=["_score"])
+
 def render_grid(data:pd.DataFrame, label:str, max_n:int=50):
     if data.empty:
         st.info("No posts in this time window for selected hashtags."); return
-    c1,c2,c3=st.columns(3)
-    with c1: srt=st.selectbox("Sort",["Engagement","Views","Recent"],key=f"s_{label}")
-    with c2: pp=st.selectbox("Platform",["All","Instagram","YouTube"],key=f"p_{label}")
-    with c3: cp=st.selectbox("Category",["All"]+sorted(data["category"].unique().tolist()),key=f"c_{label}")
+    c1,c2,c3,c4=st.columns(4)
+    with c1:
+        srt=st.selectbox("Sort by",
+            ["Engagement","Recency × Engagement","Most Recent","Views"],
+            key=f"s_{label}")
+    with c2:
+        pp=st.selectbox("Platform / Type",
+            ["All","Instagram","YouTube","YT Videos","YT Shorts"],
+            key=f"p_{label}")
+    with c3:
+        cp=st.selectbox("Category",
+            ["All"]+sorted(data["category"].unique().tolist()),
+            key=f"c_{label}")
+    with c4:
+        ht_opts=["All"]+sorted(data["hashtag"].unique().tolist())
+        hp=st.selectbox("Hashtag",ht_opts,key=f"h_{label}")
+
     d=data.copy()
-    if pp!="All": d=d[d["platform"]==pp]
+    if pp=="Instagram":  d=d[d["platform"]=="Instagram"]
+    elif pp=="YouTube":  d=d[d["platform"]=="YouTube"]
+    elif pp=="YT Shorts":d=d[d["content_type"]=="Shorts"]
+    elif pp=="YT Videos":d=d[(d["platform"]=="YouTube")&(d["content_type"]!="Shorts")]
     if cp!="All": d=d[d["category"]==cp]
-    if srt=="Engagement": d=d.sort_values("engagement",ascending=False)
-    elif srt=="Views": d=d.sort_values("views",ascending=False,na_position="last")
-    else: d=d.sort_values("scraped_at",ascending=False)
+    if hp!="All": d=d[d["hashtag"]==hp]
+
+    if srt=="Engagement":               d=d.sort_values("engagement",ascending=False)
+    elif srt=="Recency × Engagement":d=recency_x_eng(d)
+    elif srt=="Most Recent":
+        rc="uploaded_at" if ("uploaded_at" in d.columns and d["uploaded_at"].notna().any()) else "scraped_at"
+        d=d.sort_values(rc,ascending=False,na_position="last")
+    else: d=d.sort_values("views",ascending=False,na_position="last")
+
     d=d.head(max_n).reset_index(drop=True)
-    tags_shown=sorted({r["hashtag"] for _,r in d.iterrows()})
-    st.caption(f"{len(d)} posts · {srt} · tags: {', '.join(tags_shown)}")
+    ig_n=len(d[d["platform"]=="Instagram"])
+    yt_n=len(d[d["platform"]=="YouTube"])
+    sh_n=len(d[d["content_type"]=="Shorts"]) if "content_type" in d.columns else 0
+    st.caption(f"**{len(d)} posts**   IG:{ig_n}   YT:{yt_n} (Shorts:{sh_n})   sort: {srt}")
+
     for i in range(0,len(d),4):
         cols=st.columns(4)
         for j,(_,r) in enumerate(d.iloc[i:i+4].iterrows()):
             with cols[j]:
                 render_card(r.to_dict(),f"{label}_{i+j}")
 
+
 # ── TABS ──────────────────────────────────────────────────────────────────────
 now=datetime.now()
-t_l30,t_l7,t_l1,t_top,t_gt,t_stats=st.tabs([
-    "📅 Last 30 Days","📅 Last 7 Days","📅 Last 24h",
-    "🏆 Top 20","🔥 Google Trends","📊 Stats"
+
+# Use uploaded_at (real post date) for time filtering
+# uploaded_at is NaT if we couldn't extract post date — those only show in Lifetime
+ua=dff["uploaded_at"]
+
+d30=dff[ua.notna() & (ua >= now-timedelta(days=30))]
+d7 =dff[ua.notna() & (ua >= now-timedelta(days=7))]
+d1 =dff[ua.notna() & (ua >= now-timedelta(days=1))]
+dall=dff  # lifetime — all records regardless of date
+
+t_l30,t_l7,t_l1,t_all,t_gt,t_stats=st.tabs([
+    f"📅 L30 Days ({len(d30)})",
+    f"📅 L7 Days ({len(d7)})",
+    f"📅 Last 24h ({len(d1)})",
+    f"🏆 Lifetime ({len(dall)})",
+    "🔥 Google Trends",
+    "📊 Stats"
 ])
 
-# Time-window data — uses scraped_at (when we scraped it)
-# Note: all records scraped in same session will appear in all windows.
-# The meaningful difference comes after multiple scrape runs across days.
-# We show count + date range to make it clear.
-# Filter by when content was actually UPLOADED (not when we scraped it)
-d30=dff[dff["uploaded_at"]>=now-timedelta(days=30)]
-d7 =dff[dff["uploaded_at"]>=now-timedelta(days=7)]
-d1 =dff[dff["uploaded_at"]>=now-timedelta(hours=24)]
-
 with t_l30:
-    st.caption(f"Reels/videos uploaded in last 30 days: **{len(d30)}** (of {len(dff)} total)")
+    st.caption(f"Reels/videos **uploaded** in last 30 days — {len(d30)} of {len(dff)} total")
     render_grid(d30,"l30",60)
 
 with t_l7:
-    st.caption(f"Reels/videos uploaded in last 7 days: **{len(d7)}** (of {len(dff)} total)")
+    st.caption(f"Reels/videos **uploaded** in last 7 days — {len(d7)} of {len(dff)} total")
     render_grid(d7,"l7",40)
 
 with t_l1:
-    st.caption(f"Reels/videos uploaded in last 24 hours: **{len(d1)}** (of {len(dff)} total)")
+    st.caption(f"Reels/videos **uploaded** in last 24h — {len(d1)} of {len(dff)} total")
     render_grid(d1,"l1d",30)
 
-with t_top:
-    st.subheader("🏆 Top 20 by Engagement")
-    ic,yc=st.columns(2)
-    with ic:
-        st.markdown("#### 📸 Instagram")
-        ig_t=dff[dff["platform"]=="Instagram"].sort_values("engagement",ascending=False).head(20).reset_index(drop=True)
-        if ig_t.empty: st.info("No Instagram data.")
-        for i,(_,r) in enumerate(ig_t.iterrows()):
-            a,b=st.columns([1,4])
-            with a:
-                if r.get("thumbnail"): st.image(r["thumbnail"],width=58)
-                else: st.markdown('<div style="width:58px;height:58px;background:#fce7f3;border-radius:6px;display:flex;align-items:center;justify-content:center">📸</div>',unsafe_allow_html=True)
-            with b:
-                v=r.get("views"); l=r.get("likes")
-                m2="  ·  ".join(filter(None,[f"👁 {fv(v)}" if v and not pd.isna(v) else None,f"❤️ {fv(l)}" if l and not pd.isna(l) else None])) or "—"
-                st.markdown(f"**#{i+1}** {str(r.get('title',''))[:55]}")
-                st.caption(f"{m2}  ·  {r.get('creator','')}  ·  {r.get('hashtag','')}")
-                if r.get("posted_on"): st.caption(f"🕐 {r['posted_on']}")
-                st.caption(f"🏷 {str(r.get('category','')).replace('Shopsy','')}")
-                st.link_button("View →",r.get("url","#"),key=f"tig_{i}")
-            st.markdown("<hr style='margin:2px 0;border:none;border-top:1px solid #f1f5f9'>",unsafe_allow_html=True)
-    with yc:
-        st.markdown("#### ▶ YouTube")
-        yt_t=dff[dff["platform"]=="YouTube"].sort_values("engagement",ascending=False).head(20).reset_index(drop=True)
-        if yt_t.empty: st.info("No YouTube data.")
-        for i,(_,r) in enumerate(yt_t.iterrows()):
-            a,b=st.columns([1,4])
-            with a:
-                if r.get("thumbnail"): st.image(r["thumbnail"],width=58)
-                else: st.markdown('<div style="width:58px;height:58px;background:#fee2e2;border-radius:6px;display:flex;align-items:center;justify-content:center">▶</div>',unsafe_allow_html=True)
-            with b:
-                ct=str(r.get("content_type","Video"))
-                sb=f'<span style="background:#c53030;color:#fff;padding:1px 4px;border-radius:3px;font-size:8px">{ct}</span> ' if ct=="Shorts" else ""
-                st.markdown(f"**#{i+1}** {sb}{str(r.get('title',''))[:55]}",unsafe_allow_html=True)
-                st.caption(f"👁 {fv(r.get('views'))}  ·  {r.get('creator','')}  ·  {r.get('hashtag','')}")
-                if r.get("posted_on"): st.caption(f"🕐 {r['posted_on']}")
-                st.caption(f"🏷 {str(r.get('category','')).replace('Shopsy','')}")
-                st.link_button("Watch →",r.get("url","#"),key=f"tyt_{i}")
-            st.markdown("<hr style='margin:2px 0;border:none;border-top:1px solid #f1f5f9'>",unsafe_allow_html=True)
+with t_all:
+    st.subheader("🏆 Lifetime — All Scraped Content")
+    sub_tabs=st.tabs(["All","Instagram Reels","YT Videos","YT Shorts"])
+    with sub_tabs[0]: render_grid(dall,"life_all",80)
+    with sub_tabs[1]: render_grid(dall[dall["platform"]=="Instagram"],"life_ig",40)
+    with sub_tabs[2]: render_grid(dall[(dall["platform"]=="YouTube")&(dall.get("content_type","")!="Shorts")],"life_ytv",40)
+    with sub_tabs[3]: render_grid(dall[dall["content_type"]=="Shorts"],"life_yts",40)
 
 with t_gt:
     st.subheader("🔥 Google Trends India")
-    st.caption("Refreshes every 30 minutes · Stored across sessions for L30/L7/L1 history")
-
-    # Live now
     if trends_live:
         st.markdown("##### Live Right Now")
         chips=" ".join(f'<span class="tc">{t["topic"]}<span class="tv"> {t["vol"]}/day</span></span>' for t in trends_live)
         st.markdown(chips,unsafe_allow_html=True)
         st.divider()
-
-    # Historical from stored snapshots
     history=load_trends_history()
     if history:
         h_df=pd.DataFrame([
@@ -793,27 +803,23 @@ with t_gt:
             for snap in history for item in snap.get("items",[])
         ])
         h_df["fetched_at"]=pd.to_datetime(h_df["fetched_at"],errors="coerce")
-
         gt1,gt2,gt3=st.tabs(["Last 30 Days","Last 7 Days","Last 24h"])
         for tab,days,lbl in [(gt1,30,"L30"),(gt2,7,"L7"),(gt3,1,"L1")]:
             with tab:
-                cutoff=now-timedelta(days=days)
-                sub=h_df[h_df["fetched_at"]>=cutoff]
+                sub=h_df[h_df["fetched_at"]>=now-timedelta(days=days)]
                 if sub.empty:
-                    st.info(f"No trend history for {lbl} yet — check back after more scrapes.")
+                    st.info(f"No trend history for {lbl} yet.")
                 else:
-                    # Most frequent trending topics in this window
-                    freq=sub.groupby("topic").size().reset_index(name="appearances").sort_values("appearances",ascending=False)
-                    st.markdown(f"**{len(freq)} unique trending topics** in this window")
-                    for _,row in freq.head(30).iterrows():
-                        st.markdown(f'<span class="tc">{row["topic"]}<span class="tv"> {row["appearances"]}x</span></span>',unsafe_allow_html=True)
+                    freq=sub.groupby("topic").size().reset_index(name="times").sort_values("times",ascending=False)
+                    st.markdown(f"**{len(freq)} topics** trended in this window")
+                    st.markdown(" ".join(f'<span class="tc">{r["topic"]}<span class="tv"> ×{r["times"]}</span></span>' for _,r in freq.head(30).iterrows()),unsafe_allow_html=True)
     else:
-        st.info("Trend history builds up over time as the app is used. Come back after a few scrapes!")
+        st.info("Trend history builds over time. Refresh the app periodically.")
 
 with t_stats:
     st.subheader("📊 Stats")
     m1,m2,m3,m4=st.columns(4)
-    with m1: st.metric("Posts",len(dff))
+    with m1: st.metric("Total",len(dff))
     with m2: st.metric("Instagram",len(dff[dff["platform"]=="Instagram"]))
     with m3: st.metric("YouTube",len(dff[dff["platform"]=="YouTube"]))
     with m4: st.metric("Categories",dff["category"].nunique())
@@ -829,9 +835,9 @@ with t_stats:
         st.markdown("#### Vertical Engagement")
         ve=dff.groupby("vertical")["engagement"].sum().sort_values(ascending=False).reset_index()
         st.bar_chart(ve.set_index("vertical")["engagement"])
-    st.divider()
     yt2=dff[dff["platform"]=="YouTube"]
     if not yt2.empty and "content_type" in yt2.columns:
+        st.divider()
         ct2=yt2["content_type"].value_counts().reset_index(); ct2.columns=["Type","Count"]
         st.markdown("#### YouTube Types")
         st.bar_chart(ct2.set_index("Type")["Count"])
@@ -840,6 +846,6 @@ with t_stats:
     hs=dff.groupby("hashtag").agg(Posts=("url","count"),TotalEng=("engagement","sum"),AvgEng=("engagement","mean")).round(0).sort_values("TotalEng",ascending=False).reset_index()
     st.dataframe(hs,use_container_width=True)
     st.divider()
-    st.markdown("#### Full Data")
-    display_cols=[c for c in ["platform","content_type","hashtag","title","creator","views","likes","engagement","category","vertical","posted_on","url"] if c in dff.columns]
-    st.dataframe(dff[display_cols],use_container_width=True,height=350)
+    st.markdown("#### Full Data Table")
+    dc=[c for c in ["platform","content_type","hashtag","title","creator","views","likes","engagement","category","vertical","posted_on","url"] if c in dff.columns]
+    st.dataframe(dff[dc],use_container_width=True,height=350)
