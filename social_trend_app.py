@@ -1,5 +1,5 @@
 """
-social_trend_app.py \u2014 Final
+social_trend_app.py
 ============================
 - IG + YouTube reels/videos with thumbnails + in-app playback
 - Shopsy category classification (26 categories)
