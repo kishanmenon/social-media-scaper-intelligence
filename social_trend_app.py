@@ -314,7 +314,10 @@ def run_sync(hashtags, platforms, per_tag, cb=None):
 # ── APP STATE & DATA ──────────────────────────────────────────────────────────
 BASE_TAGS = ["justdropped","newarrivals","productlaunch","newproduct","comingsoon",
     "trendingnow","whatshot","tiktokmademebuyit","instamademebuyit",
-    "musthave","viralproduct","obsessed","shopnow","shopthelook"]
+    "musthave","viralproduct","obsessed","shopnow","shopthelook",
+    "giftideas","onlineshopping","founditonamazon","meeshofashion","meeshofinds",
+    "unboxing","productreview","firstimpressions","triedandtested",
+    "trendingproducts","trending","viral","indianfashion","amazonshopping","flipkartdeals"]
 DATA_FILE="social_trends_data.json"
 
 def load_data():
