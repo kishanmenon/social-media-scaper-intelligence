@@ -1,16 +1,15 @@
 """
-social_trend_app.py v14
-Key fixes:
-- Shifted all DOM extraction to pure JavaScript (`page.evaluate`) to bypass Playwright locator sync failures.
-- Captures Grid thumbnails and descriptions instantly via JS.
-- Captures Reel page meta tags (og:description, og:image, article:published_time) instantly via JS.
-- Strictly categorizes using your exact BU keyword mapping.
+social_trend_app.py v15 (Direct Script Embed)
+Key features:
+- Directly embeds the exact logic from scrape_reels_to_excel.py
+- Replaced "BU" with "Category" per user constraints.
+- Only added cookie injection for the login wall bypass.
+- Minimal UI wrapper to choose hashtags, run the exact script, and sort.
 """
 import streamlit as st
 import asyncio, sys, os, re, json, threading, subprocess, time, io
 from datetime import datetime, timedelta
 import pandas as pd
-import requests as _req
 
 st.set_page_config(page_title="Trend Tracker", page_icon="📱", layout="wide")
 
@@ -29,7 +28,7 @@ def secret(k,d=""):
 IG_SESSIONID=secret("IG_SESSIONID")
 IG_CSRFTOKEN=secret("IG_CSRFTOKEN")
 
-# ── CATEGORY CLASSIFIER (From Reference Code) ─────────────────────────────────
+# ── CATEGORY CLASSIFIER (Direct from your _BU_RULES) ──────────────────────────
 _CATEGORY_RULES = [
     ("Not A Product Video", re.compile(
         r"\b(news|politics|cricket|football|movie|song|music|dance|comedy|"
@@ -83,34 +82,12 @@ _CATEGORY_RULES = [
 ]
 
 def classify_category(title: str) -> str:
-    if not title: return "Other"
+    if not title: return "None"
     for cat, pat in _CATEGORY_RULES:
         if pat.search(title): return cat
-    return "Other"
+    return "None"
 
-# ── DATA ──────────────────────────────────────────────────────────────────────
-BASE_TAGS=["tiktokmademebuyit","instamademebuyit","musthave","viralproduct","justdropped",
-    "newarrivals","trendingproducts","unboxing","productreview","triedandtested",
-    "meeshofashion","meeshofinds","indianfashion","amazonshopping","onlineshopping",
-    "shopthelook","kurtidesign","ethnicwear","makeuptutorial","skincareroutine",
-    "hairtransformation","fitnessmotivation","gadgetreview","techunboxing",
-    "homedecorinspo","kitchenhacks","meeshohaul","flipkartfinds"]
-DATA_FILE="social_trends_data.json"
-
-def load_data():
-    if not os.path.exists(DATA_FILE): return []
-    try: return json.load(open(DATA_FILE))
-    except: return []
-
-def save_data(records):
-    by_url={}
-    for r in records:
-        url=r.get("url","")
-        if url not in by_url or r.get("scraped_at","")>by_url[url].get("scraped_at",""):
-            by_url[url]=r
-    json.dump(list(by_url.values()),open(DATA_FILE,"w"),ensure_ascii=False,indent=2)
-
-# ── PARSERS ───────────────────────────────────────────────────────────────────
+# ── UTILITIES (Direct from your code) ──────────────────────────────────────────
 def parse_num(s):
     if not s: return None
     s = str(s).strip()
@@ -137,196 +114,141 @@ def fmt(domain, link):
     if link.startswith("http"): return link
     return f"{domain}{link}" if link.startswith("/") else f"{domain}/{link}"
 
-# ── SCRAPERS ──────────────────────────────────────────────────────────────────
-async def scrape_ig(ctx, tag, limit=15):
+async def scroll(page, n=3, d=1500):
+    for _ in range(n):
+        await page.evaluate(f"window.scrollBy(0,{d})")
+        await asyncio.sleep(0.8)
+
+# ── SCRAPERS (Direct from your code) ───────────────────────────────────────────
+async def scrape_ig_tag(ctx, tag, limit=100):
+    """Scrapes IG using exact logic from scrape_reels_to_excel.py"""
     rows = []
     page = await ctx.new_page()
     reel_urls = []
     try:
         await page.goto(f"https://www.instagram.com/explore/tags/{tag}/", wait_until="domcontentloaded", timeout=25000)
         await asyncio.sleep(4)
-        
         if "login" in page.url or "accounts" in page.url:
             return rows
-
-        for _ in range(5):
-            await page.evaluate("window.scrollBy(0,1200)")
-            await asyncio.sleep(0.8)
-
-        # 1. Pure JS Grid Extraction
-        grid_items = await page.evaluate('''() => {
-            let items = [];
-            document.querySelectorAll('a[href*="/p/"], a[href*="/reel/"]').forEach(a => {
-                let img = a.querySelector('img');
-                items.push({
-                    href: a.getAttribute('href'),
-                    alt: img ? img.getAttribute('alt') : '',
-                    src: img ? img.getAttribute('src') : ''
-                });
-            });
-            return items;
-        }''')
-
-        seen_u = set()
-        for item in grid_items:
-            href = item.get("href")
-            if not href or href in seen_u: continue
-            seen_u.add(href)
-            
-            full_url = fmt("https://www.instagram.com", href)
-            reel_urls.append((item.get("alt") or "", item.get("src") or "", full_url))
-            if len(reel_urls) >= limit: break
+        
+        await scroll(page, 5, 1200)
+        links = await page.locator("a[href*='/reel/'], a[href*='/p/']").all()
+        for el in links[:limit]:
+            href = await el.get_attribute("href")
+            if not href: continue
+            img_el = el.locator("img").first
+            alt = (await img_el.get_attribute("alt") if await img_el.count() else "") or ""
+            thumb = (await img_el.get_attribute("src") if await img_el.count() else "") or ""
+            full = fmt("https://www.instagram.com", href)
+            reel_urls.append((alt[:200], full, thumb))
     except: pass
     finally:
         try: await page.close()
         except: pass
 
-    # 2. Pure JS Meta Data Extraction on Individual Reel Pages
-    for grid_alt, grid_thumb, url in reel_urls:
+    for i, (alt, url, thumb) in enumerate(reel_urls[:limit]):
         rp = await ctx.new_page()
         views = likes = None
-        title = grid_alt[:100] if grid_alt else f"#{tag} reel"
-        desc_text = grid_alt 
-        thumb = grid_thumb
-        creator = ""
-        posted_on = datetime.now().isoformat()
-        
+        title = alt
         try:
             await rp.goto(url, wait_until="domcontentloaded", timeout=18000)
-            await asyncio.sleep(1.5)
-            
-            # Instantly pull meta tags via browser JS API
-            meta_data = await rp.evaluate('''() => {
-                let getMeta = (prop) => {
-                    let el = document.querySelector(`meta[property="${prop}"], meta[name="${prop}"]`);
-                    return el ? el.getAttribute('content') : '';
-                };
-                return {
-                    og_desc: getMeta('og:description'),
-                    og_img: getMeta('og:image'),
-                    title: document.title,
-                    pub_time: getMeta('article:published_time') || (document.querySelector('time') ? document.querySelector('time').getAttribute('datetime') : '')
-                };
-            }''')
-
-            og_desc = meta_data.get("og_desc") or ""
-            if og_desc:
-                vm = re.search(r"([\d,\.]+(?:[\s\u00a0]+(?:crore|lakh))?[KMB]?)\s*(?:views?|plays?)", og_desc, re.I)
+            await asyncio.sleep(1)
+            html = await rp.content()
+            og = re.search(r'og:description[^>]*content="([^"]*)"', html, re.I)
+            if og:
+                desc = og.group(1)
+                vm = re.search(r"([\d,\.]+(?:[\s\u00a0]+(?:crore|lakh))?[KMB]?)\s*(?:views?|plays?)", desc, re.I)
                 if vm: views = parse_num(vm.group(1).strip())
-                
-                lm = re.search(r"([\d,\.]+[KMB]?)\s*likes?", og_desc, re.I)
+                lm = re.search(r"([\d,\.]+[KMB]?)\s*likes?", desc, re.I)
                 if lm: likes = parse_num(lm.group(1).strip())
-                
-                cap = re.search(r"(@[\w\.]+):\s*(.+)", og_desc, re.S)
-                if cap:
-                    creator = cap.group(1)
-                    if not desc_text: desc_text = cap.group(2).strip()
-            
-            t = meta_data.get("title", "")
-            if t:
-                t = re.sub(r"\s*[•·|]\s*Instagram.*$", "", t).strip()
+            t_tag = re.search(r"<title>([^<]+)</title>", html, re.I)
+            if t_tag:
+                t = re.sub(r"\s*[•·|]\s*Instagram.*$", "", t_tag.group(1)).strip()
                 if len(t) > 5: title = t[:200]
-
-            if meta_data.get("og_img"): thumb = meta_data["og_img"].replace("&amp;", "&")
-            if meta_data.get("pub_time"): posted_on = meta_data["pub_time"]
-
         except: pass
         finally:
             try: await rp.close()
             except: pass
 
-        final_cat = classify_category(f"{title} {desc_text} {tag}")
-
+        eng = views or likes
         rows.append({
-            "platform": "Instagram", "content_type": "Reel",
-            "hashtag": f"#{tag}", "url": url, "title": title.replace('\n', ' '),
-            "description": desc_text.replace('\n', ' '), "creator": creator,
-            "thumbnail": thumb, "posted_on": posted_on, "views": views, "likes": likes,
-            "engagement": views or likes or 0, "category": final_cat,
+            "hashtag": f"#{tag}",
+            "platform": "Instagram",
+            "title": title.replace('\n', ' '),
+            "url": url,
+            "views": views,
+            "likes": likes,
+            "engagement": eng or 0,
+            "category": classify_category(title),
+            "thumbnail": thumb,
             "scraped_at": datetime.now().isoformat(),
+            "posted_on": datetime.now().isoformat(), # fallback for sorting
         })
+    return rows
 
-    rows.sort(key=lambda x: x.get("views") or 0, reverse=True)
-    return rows[:limit]
-
-async def scrape_yt(ctx, tag, limit=25):
-    rows=[]; page=await ctx.new_page()
+async def scrape_yt_tag(ctx, tag, limit=100):
+    """Scrapes YT using exact logic from scrape_reels_to_excel.py"""
+    rows = []
+    page = await ctx.new_page()
     try:
-        await page.goto(f"https://www.youtube.com/results?search_query=%23{tag}&sp=CAI%3D", wait_until="domcontentloaded", timeout=25000)
+        await page.goto(f"https://www.youtube.com/results?search_query=%23{tag}", wait_until="domcontentloaded", timeout=25000)
         await asyncio.sleep(3)
-        prev=0
-        for _ in range(5):
-            await page.evaluate("window.scrollBy(0,3000)")
-            await asyncio.sleep(1.2)
-            vids=await page.query_selector_all("ytd-video-renderer,ytd-rich-item-renderer")
-            if len(vids)>=limit or len(vids)==prev: break
-            prev=len(vids)
-            
-        vids=await page.query_selector_all("ytd-video-renderer,ytd-rich-item-renderer")
+        for _ in range(8):
+            await page.evaluate("window.scrollBy(0, 3000)")
+            await asyncio.sleep(1)
+            vids = await page.query_selector_all("ytd-video-renderer,ytd-rich-item-renderer")
+            if len(vids) >= limit: break
+
+        vids = await page.query_selector_all("ytd-video-renderer,ytd-rich-item-renderer")
         for v in vids[:limit]:
-            t_el=await v.query_selector("#video-title,a#video-title")
+            t_el = await v.query_selector("#video-title,a#video-title")
             if not t_el: continue
-            title=(await t_el.inner_text()).strip()
+            title = (await t_el.inner_text()).strip()
             if not title: continue
             
-            views=None
+            views = None
             spans = await v.query_selector_all("#metadata-line span")
             for span in spans:
-                st2=(await span.inner_text()).strip()
-                vm=re.search(r"([\d,\.]+(?:[\s\u00a0]+(?:crore|lakh))?[KMB]?)\s*views?", st2, re.I)
-                if vm: views = parse_num(vm.group(1).strip()); break
+                st = (await span.inner_text()).strip()
+                vm = re.search(r"([\d,\.]+(?:[\s\u00a0]+(?:crore|lakh))?[KMB]?)\s*views?", st, re.I)
+                if vm:
+                    views = parse_num(vm.group(1).strip())
+                    if views: break
             if not views:
                 aria = await t_el.get_attribute("aria-label") or ""
                 vm2 = re.search(r"([\d,\.]+(?:[\s\u00a0]+(?:crore|lakh))?[KMB]?)\s*views?", aria, re.I)
                 if vm2: views = parse_num(vm2.group(1).strip())
-            
-            posted_on = datetime.now().isoformat()
-            for span in spans:
-                st2=(await span.inner_text()).strip()
-                m2=re.search(r"(\d+)\s*(second|minute|hour|day|week|month|year)s?\s*ago", st2, re.I)
-                if m2:
-                    n2=int(m2.group(1)); unit=m2.group(2).lower()
-                    delta_map={"second":1,"minute":60,"hour":3600,"day":86400, "week":604800,"month":2592000,"year":31536000}
-                    secs=n2*delta_map.get(unit,86400)
-                    approx=datetime.now()-timedelta(seconds=secs)
-                    posted_on=approx.isoformat()
-                    break
-                    
-            ch=await v.query_selector("#channel-name a,ytd-channel-name a")
-            channel=(await ch.inner_text()).strip() if ch else ""
-            href=await t_el.get_attribute("href") or ""
-            is_s="/shorts/" in href
-            if not is_s:
-                dur=await v.query_selector("span.ytd-thumbnail-overlay-time-status-renderer")
-                if dur:
-                    dt=(await dur.inner_text()).strip()
-                    dm=re.match(r"^0:(\d+)$",dt)
-                    if dm and int(dm.group(1))<=60: is_s=True
-            vid_m=re.search(r"(?:v=|/shorts/)([A-Za-z0-9_-]{11})",href)
-            vid_id=vid_m.group(1) if vid_m else ""
-            thumb=f"https://img.youtube.com/vi/{vid_id}/mqdefault.jpg" if vid_id else ""
-            
-            final_cat = classify_category(f"{title} {tag}")
-            
+                
+            href = await t_el.get_attribute("href") or ""
+            url = fmt("https://www.youtube.com", href)
+            vid_m = re.search(r"(?:v=|/shorts/)([A-Za-z0-9_-]{11})", href)
+            vid_id = vid_m.group(1) if vid_m else ""
+            thumb = f"https://img.youtube.com/vi/{vid_id}/mqdefault.jpg" if vid_id else ""
+
             rows.append({
-                "platform":"YouTube", "content_type":"Shorts" if is_s else "Video",
-                "hashtag":f"#{tag}", "url":fmt("https://www.youtube.com",href),
-                "title":title, "description":"", "creator":channel,
-                "thumbnail":thumb, "vid_id":vid_id,
-                "posted_on":posted_on, "views":views, "likes":None,
-                "engagement":views or 0, "category":final_cat,
-                "scraped_at":datetime.now().isoformat(),
+                "hashtag": f"#{tag}",
+                "platform": "YouTube",
+                "title": title.replace('\n', ' '),
+                "url": url,
+                "views": views,
+                "likes": None,
+                "engagement": views or 0,
+                "category": classify_category(title),
+                "thumbnail": thumb,
+                "scraped_at": datetime.now().isoformat(),
+                "posted_on": datetime.now().isoformat(), # fallback for sorting
             })
-        rows.sort(key=lambda x:x.get("views") or 0,reverse=True)
+        rows.sort(key=lambda x: x["views"] or 0, reverse=True)
     except: pass
     finally:
         try: await page.close()
         except: pass
     return rows
 
-async def _run_all(hashtags,platforms,per_tag,progress_cb):
+async def _run_all(hashtags, platforms, per_tag, progress_cb):
     from playwright.async_api import async_playwright
-    all_records=[]; BATCH=3
+    all_records=[]
+    BATCH=3
     async with async_playwright() as pw:
         total=len(hashtags); done=0
         for i in range(0,total,BATCH):
@@ -338,7 +260,7 @@ async def _run_all(hashtags,platforms,per_tag,progress_cb):
             if progress_cb: progress_cb(done/total,f"{done}/{total} hashtags")
     return all_records
 
-async def _scrape_one(pw,tag,platforms,per_tag):
+async def _scrape_one(pw, tag, platforms, per_tag):
     rows=[]
     args=["--disable-blink-features=AutomationControlled","--no-sandbox","--disable-gpu",
           "--ignore-certificate-errors","--disable-dev-shm-usage","--disable-setuid-sandbox", "--no-zygote","--mute-audio"]
@@ -346,32 +268,32 @@ async def _scrape_one(pw,tag,platforms,per_tag):
     except:
         args.append("--single-process")
         browser=await pw.chromium.launch(headless=True,args=args)
+    
     ctx=await browser.new_context(
         viewport={"width":1280,"height":800},
         user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0 Safari/537.36",
         extra_http_headers={"Accept-Language":"en-IN,en;q=0.9"})
     await ctx.add_init_script("Object.defineProperty(navigator,'webdriver',{get:()=>undefined});")
+    
+    # EXACT COOKIE INJECTION TO BYPASS LOGIN
     cks=[]
     if IG_SESSIONID: cks.append({"name":"sessionid","value":IG_SESSIONID,"domain":".instagram.com","path":"/","httpOnly":True,"secure":True,"sameSite":"Lax"})
     if IG_CSRFTOKEN: cks.append({"name":"csrftoken","value":IG_CSRFTOKEN,"domain":".instagram.com","path":"/","secure":True,"sameSite":"Lax"})
     if cks: await ctx.add_cookies(cks)
+    
     try:
         if "Instagram" in platforms:
-            try:
-                ig=await scrape_ig(ctx,tag,per_tag)
-                rows.extend(ig)
-            except: pass
+            ig_rows = await scrape_ig_tag(ctx, tag, per_tag)
+            rows.extend(ig_rows)
         if "YouTube" in platforms:
-            try:
-                yt=await scrape_yt(ctx,tag,per_tag)
-                rows.extend(yt)
-            except: pass
+            yt_rows = await scrape_yt_tag(ctx, tag, per_tag)
+            rows.extend(yt_rows)
     finally:
         try: await ctx.close(); await browser.close()
         except: pass
     return rows
 
-def run_sync(hashtags,platforms,per_tag,cb=None):
+def run_sync(hashtags, platforms, per_tag, cb=None):
     result={}; exc=[]; ps={"f":0,"m":"Starting..."}
     def _p(f,m): ps["f"]=f; ps["m"]=m
     def _t():
@@ -389,14 +311,31 @@ def run_sync(hashtags,platforms,per_tag,cb=None):
     if exc: raise exc[0]
     return result.get("r",[])
 
-# ── SESSION STATE ─────────────────────────────────────────────────────────────
+# ── APP STATE & DATA ──────────────────────────────────────────────────────────
+BASE_TAGS = ["justdropped","newarrivals","productlaunch","newproduct","comingsoon",
+    "trendingnow","whatshot","tiktokmademebuyit","instamademebuyit",
+    "musthave","viralproduct","obsessed","shopnow","shopthelook"]
+DATA_FILE="social_trends_data.json"
+
+def load_data():
+    if not os.path.exists(DATA_FILE): return []
+    try: return json.load(open(DATA_FILE))
+    except: return []
+
+def save_data(records):
+    by_url={}
+    for r in records:
+        url=r.get("url","")
+        if url not in by_url or r.get("scraped_at","")>by_url[url].get("scraped_at",""):
+            by_url[url]=r
+    json.dump(list(by_url.values()),open(DATA_FILE,"w"),ensure_ascii=False,indent=2)
+
 if "init" not in st.session_state:
     st.session_state.init=True
-    st.session_state.sel_tags=BASE_TAGS[:10]
+    st.session_state.sel_tags=BASE_TAGS[:5]
     st.session_state.sel_plats=["Instagram","YouTube"]
     st.session_state.per_tag=10
     st.session_state.sort_mode="Engagement ↓"
-    st.session_state.playing=None
 
 # ── STYLES ────────────────────────────────────────────────────────────────────
 st.markdown("""
@@ -408,29 +347,23 @@ st.markdown("""
 .hero{background:linear-gradient(135deg,#0f172a,#312e81);border-radius:12px;padding:20px 28px;margin-bottom:14px;}
 .hero-t{font-size:20px;font-weight:700;color:#f8fafc;}
 .hero-s{font-size:11px;color:#a5b4fc;}
-.cw{border-radius:10px;overflow:hidden;box-shadow:0 2px 8px rgba(0,0,0,.09);background:#fff;margin-bottom:6px;}
-.tb{position:relative;background:#111;}
+.tb{position:relative;background:#111;border-radius:8px 8px 0 0;overflow:hidden;}
 .tb img{width:100%;height:145px;object-fit:cover;display:block;}
-.pi{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);width:36px;height:36px;background:rgba(0,0,0,.62);border-radius:50%;display:flex;align-items:center;justify-content:center;color:#fff;font-size:13px;pointer-events:none;}
-.st{position:absolute;top:5px;right:5px;background:#c53030;color:#fff;padding:1px 5px;border-radius:3px;font-size:8px;font-weight:700;}
-.cb{padding:7px 9px 9px;}
-.ct{font-size:11.5px;font-weight:600;color:#1e293b;line-height:1.3;margin:2px 0;}
-.cd{font-size:10px;color:#64748b;line-height:1.25;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;margin-bottom:2px;}
-.cm{font-size:10.5px;color:#64748b;margin:1px 0;}
-.pb{display:inline-block;padding:1px 5px;border-radius:4px;font-size:8.5px;font-weight:700;color:#fff;margin-right:2px;}
-.ca{display:inline-block;padding:2px 7px;border-radius:11px;font-size:9.5px;background:#f0f4ff;color:#4361ee;margin-top:3px;}
-.tc{display:inline-block;background:#f0f4ff;color:#4361ee;padding:3px 9px;border-radius:18px;font-size:10.5px;margin:2px;font-weight:500;}
-.tv{font-size:9px;color:#94a3b8;margin-left:2px;}
-</style>""",unsafe_allow_html=True)
+.cb{padding:7px 9px 9px;background:#fff;border-radius:0 0 8px 8px;box-shadow:0 2px 8px rgba(0,0,0,.09);}
+.ct{font-size:11.5px;font-weight:600;color:#1e293b;line-height:1.3;margin:4px 0;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;}
+.cm{font-size:10.5px;color:#64748b;margin:2px 0;}
+.pb{display:inline-block;padding:2px 6px;border-radius:4px;font-size:8.5px;font-weight:700;color:#fff;margin-right:4px;}
+.ca{display:inline-block;padding:2px 7px;border-radius:11px;font-size:9.5px;background:#f0f4ff;color:#4361ee;margin-top:4px;}
+</style>""", unsafe_allow_html=True)
 
 st.markdown('<div class="hero"><div class="hero-t">📱 Social Trend Tracker</div>'
-            '<div class="hero-s">Instagram + YouTube · Auto-classified Categories</div></div>',
+            '<div class="hero-s">Exact Script Extraction • Classified Categories</div></div>',
             unsafe_allow_html=True)
 
-# ── SIDEBAR (sticky) ──────────────────────────────────────────────────────────
+# ── SIDEBAR ───────────────────────────────────────────────────────────────────
 with st.sidebar:
     st.title("⚙️ Settings")
-    new_t=st.multiselect("Hashtags",BASE_TAGS,default=st.session_state.sel_tags,key="tp")
+    new_t=st.multiselect("Hashtags",BASE_TAGS,default=st.session_state.sel_tags)
     if new_t!=st.session_state.sel_tags: st.session_state.sel_tags=new_t
     custom=st.text_input("+ Custom tag",placeholder="kurtilovers")
     if custom:
@@ -439,21 +372,19 @@ with st.sidebar:
             if tag not in BASE_TAGS: BASE_TAGS.append(tag)
             st.session_state.sel_tags=st.session_state.sel_tags+[tag]
             st.rerun()
-    new_p=st.multiselect("Platforms",["Instagram","YouTube"],default=st.session_state.sel_plats,key="pp")
+    new_p=st.multiselect("Platforms",["Instagram","YouTube"],default=st.session_state.sel_plats)
     if new_p!=st.session_state.sel_plats: st.session_state.sel_plats=new_p
-    new_n=st.slider("Posts per hashtag per platform",5,30,st.session_state.per_tag,key="pn")
+    new_n=st.slider("Posts per hashtag per platform", 5, 100, st.session_state.per_tag)
     if new_n!=st.session_state.per_tag: st.session_state.per_tag=new_n
     st.divider()
-    new_sort=st.radio("Sort / Rank by",
-        ["Engagement ↓","Recency × Engagement","Most Recent ↓"],
-        index=["Engagement ↓","Recency × Engagement","Most Recent ↓"].index(st.session_state.get("sort_mode","Engagement ↓")),
-        key="sort_radio")
-    if new_sort!=st.session_state.get("sort_mode"): st.session_state.sort_mode=new_sort
+    new_sort=st.radio("Sort / Rank by", ["Engagement ↓", "Most Recent ↓"], 
+                      index=["Engagement ↓", "Most Recent ↓"].index(st.session_state.sort_mode))
+    if new_sort!=st.session_state.sort_mode: st.session_state.sort_mode=new_sort
     st.divider()
     scrape_btn=st.button("🚀 Scrape Now",type="primary",use_container_width=True)
     st.divider()
     all_db=load_data()
-    st.metric("Stored",len(all_db))
+    st.metric("Stored Records",len(all_db))
     if st.button("🗑 Clear data",use_container_width=True):
         save_data([]); st.rerun()
 
@@ -471,38 +402,27 @@ if scrape_btn and sel_tags:
         new_recs=run_sync(sel_tags,sel_plats,per_n,cb)
         save_data(load_data()+new_recs)
         prog.empty(); status.empty()
-        ig_n=sum(1 for r in new_recs if r.get("platform")=="Instagram")
-        yt_n=sum(1 for r in new_recs if r.get("platform")=="YouTube")
-        st.success(f"✅ Scraped {len(new_recs)} posts  (IG:{ig_n} YT:{yt_n})")
+        st.success(f"✅ Scraped {len(new_recs)} posts.")
         st.rerun()
     except Exception as e:
         st.error(str(e))
 
 all_data=load_data()
-sel_ht={f"#{t}" for t in sel_tags}
-
 if not all_data:
     st.info("No data. Select hashtags → Scrape."); st.stop()
 
 df=pd.DataFrame(all_data)
-df["scraped_at"]=pd.to_datetime(df["scraped_at"],errors="coerce")
 df["engagement"]=pd.to_numeric(df.get("engagement",0),errors="coerce").fillna(0)
 df["views"]=pd.to_numeric(df.get("views",None),errors="coerce")
 df["likes"]=pd.to_numeric(df.get("likes",None),errors="coerce")
-if "hashtag" not in df.columns: df["hashtag"]=""
-if "category" not in df.columns: df["category"]="Other"
-if "content_type" not in df.columns: df["content_type"]=""
-if "posted_on" not in df.columns: df["posted_on"]=""
-# Accurate extracted date logic for the UI tabs
-df["uploaded_at"]=pd.to_datetime(df["posted_on"],errors="coerce")
 
-df_sel=df[df["hashtag"].isin(sel_ht)].copy()
+df_sel=df[df["hashtag"].isin({f"#{t}" for t in sel_tags})].copy()
 if df_sel.empty: df_sel=df.copy()
 
 # ── VIEW FILTERS ──────────────────────────────────────────────────────────────
 st.markdown("---")
 cat_opts=["All"]+sorted(df_sel["category"].unique())
-cf_val=st.selectbox("Filter by Category", cat_opts, key="gfc")
+cf_val=st.selectbox("Filter by Category", cat_opts)
 
 dff=df_sel.copy()
 if sel_plats: dff=dff[dff["platform"].isin(sel_plats)]
@@ -519,92 +439,34 @@ def fv(v):
     if v>=1_000: return f"{v/1_000:.0f}K"
     return str(v)
 
-def recency_x_eng(data):
-    import numpy as np
-    d=data.copy()
-    ref_col="uploaded_at" if d["uploaded_at"].notna().any() else "scraped_at"
-    ref=pd.to_datetime(d[ref_col],errors="coerce")
-    age_days=((pd.Timestamp.now()-ref).dt.total_seconds()/86400).fillna(30).clip(0,365)
-    eng=pd.to_numeric(d["engagement"],errors="coerce").fillna(0)
-    d["_score"]=eng*np.exp(-age_days/7)
-    return d.sort_values("_score",ascending=False).drop(columns=["_score"])
+if st.session_state.sort_mode == "Engagement ↓":
+    dff = dff.sort_values("engagement", ascending=False)
+else:
+    dff = dff.sort_values("scraped_at", ascending=False)
 
-def apply_sort(d):
-    srt=st.session_state.get("sort_mode","Engagement ↓")
-    if srt=="Engagement ↓": return d.sort_values("engagement",ascending=False)
-    elif srt=="Recency × Engagement": return recency_x_eng(d)
-    else: return d.sort_values("uploaded_at",ascending=False,na_position="last")
+st.caption(f"Showing {len(dff)} posts.")
+dff = dff.reset_index(drop=True)
 
-def render_card(r:dict, card_id:str):
-    plat =r.get("platform",""); ctype=r.get("content_type","")
-    url  =r.get("url","#") or "#"; thumb=r.get("thumbnail","")
-    title=str(r.get("title",""))[:80]; desc=str(r.get("description",""))[:100]
-    cat  =str(r.get("category",""))
-    ht   =r.get("hashtag",""); views=r.get("views"); likes=r.get("likes")
-    eng  =r.get("engagement",0); cr=r.get("creator","")
-    vid_id=str(r.get("vid_id","") or "")
-    posted=r.get("posted_on","")
-    bc   ="#e1306c" if plat=="Instagram" else "#ff0000"
-    is_s =ctype=="Shorts"
-    is_playing=st.session_state.playing==card_id
-
-    if is_playing:
-        if plat=="YouTube" and vid_id:
-            st.markdown(f'<iframe width="100%" height="175" src="https://www.youtube.com/embed/{vid_id}?autoplay=1" frameborder="0" allowfullscreen style="border-radius:8px;display:block;margin-bottom:4px"></iframe>',unsafe_allow_html=True)
-        elif plat=="Instagram":
-            st.markdown(f'<blockquote class="instagram-media" data-instgrm-permalink="{url}" data-instgrm-version="14" style="width:100%!important;min-width:180px"></blockquote><script async src="//www.instagram.com/embed.js"></script>',unsafe_allow_html=True)
-        if st.button("✕ Close",key=f"cls_{card_id}",use_container_width=True):
-            st.session_state.playing=None; st.rerun()
-    else:
-        if thumb:
-            sb='<div class="st">SHORTS</div>' if is_s else ""
-            st.markdown(f'<div class="tb"><img src="{thumb}" onerror="this.parentNode.style.background=\'#f1f5f9\';this.style.display=\'none\'"><div class="pi">▶</div>{sb}</div>',unsafe_allow_html=True)
-        else:
-            em="📸" if plat=="Instagram" else "▶"
-            bg="#fce7f3" if plat=="Instagram" else "#fee2e2"
-            st.markdown(f'<div style="height:145px;background:{bg};border-radius:8px 8px 0 0;display:flex;align-items:center;justify-content:center;font-size:28px">{em}</div>',unsafe_allow_html=True)
-        if st.button("▶ Play",key=f"play_{card_id}",use_container_width=True):
-            st.session_state.playing=card_id; st.rerun()
-
-    ht_b=f'<span style="background:#e8ecff;color:#4361ee;padding:1px 4px;border-radius:4px;font-size:8.5px">{ht}</span>'
-    pb=f'<span class="pb" style="background:{bc}">{plat}</span>'
-    if is_s: pb+=f'<span class="pb" style="background:#c53030">SHORTS</span>'
-    metric="  ·  ".join(filter(None,[f"👁 {fv(views)}" if not pd.isna(views) else None, f"❤️ {fv(likes)}" if not pd.isna(likes) else None])) or f"Eng: {fv(eng)}"
-    posted_line=f'<div class="cm">🕐 {posted[:10] if posted else ""}</div>' if posted else ""
-    st.markdown(f"""<div class="cb"><div>{pb} {ht_b}</div><div class="ct">{title}</div>{"<div class='cd'>"+desc+"</div>" if desc else ""}{"<div class='cm'>👤 "+cr+"</div>" if cr else ""}{posted_line}<div class="cm">{metric}</div><div class="ca">🏷 {cat}</div></div>""",unsafe_allow_html=True)
-    st.link_button("Open ↗",url,use_container_width=True)
-
-def render_grid(data, label, max_n=50, ct_filter="All"):
-    if data.empty: st.info("No posts for this view."); return
-    d=data.copy()
-    if ct_filter=="Shorts": d=d[d["content_type"]=="Shorts"]
-    elif ct_filter=="Videos": d=d[(d["platform"]=="YouTube")&(d["content_type"]!="Shorts")]
-    elif ct_filter=="Instagram": d=d[d["platform"]=="Instagram"]
-    elif ct_filter=="YouTube": d=d[d["platform"]=="YouTube"]
-    d=apply_sort(d).head(max_n).reset_index(drop=True)
-    st.caption(f"**{len(d)} posts** displayed")
-    for i in range(0,len(d),4):
-        cols=st.columns(4)
-        for j,(_,r) in enumerate(d.iloc[i:i+4].iterrows()):
-            with cols[j]: render_card(r.to_dict(),f"{label}_{i+j}")
-
-now=datetime.now()
-ua=pd.to_datetime(dff["uploaded_at"],errors="coerce")
-d30=dff[ua.notna()&(ua>=now-timedelta(days=30))]
-d7 =dff[ua.notna()&(ua>=now-timedelta(days=7))]
-d1 =dff[ua.notna()&(ua>=now-timedelta(days=1))]
-
-t_l30,t_l7,t_l1,t_all,t_stats=st.tabs([f"📅 L30 Days ({len(d30)})",f"📅 L7 Days ({len(d7)})",f"📅 Last 24h ({len(d1)})",f"🏆 Lifetime ({len(dff)})","📊 Stats"])
-
-with t_l30: render_grid(d30,"l30",60)
-with t_l7: render_grid(d7,"l7",40)
-with t_l1: render_grid(d1,"l1d",30)
-with t_all: render_grid(dff,"life_all",80)
-
-with t_stats:
-    st.subheader("📊 Stats")
-    m1,m2,m3,m4=st.columns(4)
-    with m1: st.metric("Total",len(dff))
-    with m2: st.metric("Instagram",len(dff[dff["platform"]=="Instagram"]))
-    with m3: st.metric("YouTube",len(dff[dff["platform"]=="YouTube"]))
-    with m4: st.metric("Categories",dff["category"].nunique())
+for i in range(0,len(dff),4):
+    cols=st.columns(4)
+    for j,(_,r) in enumerate(dff.iloc[i:i+4].iterrows()):
+        with cols[j]:
+            plat = r.get("platform","")
+            bc = "#e1306c" if plat=="Instagram" else "#ff0000"
+            thumb = r.get("thumbnail","")
+            if thumb:
+                st.markdown(f'<div class="tb"><img src="{thumb}" onerror="this.parentNode.style.background=\'#f1f5f9\';this.style.display=\'none\'"></div>',unsafe_allow_html=True)
+            else:
+                em = "📸" if plat=="Instagram" else "▶"
+                bg = "#fce7f3" if plat=="Instagram" else "#fee2e2"
+                st.markdown(f'<div class="tb" style="background:{bg};display:flex;align-items:center;justify-content:center;font-size:28px">{em}</div>',unsafe_allow_html=True)
+            
+            metric = "  ·  ".join(filter(None,[f"👁 {fv(r.get('views'))}" if not pd.isna(r.get('views')) else None, f"❤️ {fv(r.get('likes'))}" if not pd.isna(r.get('likes')) else None])) or f"Eng: {fv(r.get('engagement'))}"
+            
+            st.markdown(f"""<div class="cb">
+                <div><span class="pb" style="background:{bc}">{plat}</span> <span style="color:#4361ee;font-size:8.5px">{r.get("hashtag","")}</span></div>
+                <div class="ct">{r.get("title","")}</div>
+                <div class="cm">{metric}</div>
+                <div class="ca">🏷 {r.get("category","")}</div>
+            </div><br>""",unsafe_allow_html=True)
+            st.link_button("Open ↗", r.get("url","#"), use_container_width=True)
