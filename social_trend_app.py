@@ -1,19 +1,19 @@
 """
-social_trend_app.py v9
-Key fixes:
-- Replaced sub-category/vertical split with a single Broad Category classification based on description
-- Added <time datetime="..."> extraction to accurately capture IG uploaded_at dates
-- Enhanced thumbnail extraction using internal JSON endpoints
-- Removed UI Vertical filter for a cleaner, single broad category filter
+social_trend_app.py v10
+Key fixes based on scrape_reels_to_excel.py:
+- Completely removed "Vertical" UI filters and old category dictionaries.
+- Integrated exact _BU_RULES regex classification from reference code.
+- Integrated exact og:description regex parsing for IG views/likes.
+- Added strict <time> and article:published_time regex for accurate IG dates.
+- Enforced no-referrer policy for thumbnails.
 """
 import streamlit as st
 import asyncio, sys, os, re, json, threading, subprocess, time, io
 from datetime import datetime, timedelta
-from urllib.parse import quote
 import pandas as pd
 import requests as _req
 
-st.set_page_config(page_title="Trend Tracker · Shopsy", page_icon="📱", layout="wide")
+st.set_page_config(page_title="Trend Tracker · BU Classification", page_icon="📱", layout="wide")
 
 @st.cache_resource
 def install_chromium():
@@ -30,106 +30,63 @@ def secret(k,d=""):
 IG_SESSIONID=secret("IG_SESSIONID")
 IG_CSRFTOKEN=secret("IG_CSRFTOKEN")
 
-# ── CATEGORIES & VERTICALS ────────────────────────────────────────────────────
-CATS=[
-    ("ShopsyWomenEthnicContemporary",["kurti","kurta","saree","sari","lehenga","salwar",
-        "dupatta","anarkali","palazzo","patiala","sharara","churidar","ethnic wear",
-        "silk saree","banarasi","bandhani","chanderi","cotton kurti","rayon kurti"]),
-    ("ShopsyWomenWesternCore",["crop top","co-ord","coord set","bodycon","midi dress",
-        "maxi dress","women top","women shirt","women dress","women skirt","women jeans",
-        "women jacket","women blazer","women hoodie","women tshirt"]),
-    ("ShopsyMakeupFragrances",["lipstick","lip gloss","lip liner","foundation","concealer",
-        "mascara","eyeliner","eyeshadow","blush","highlighter","kajal","makeup","nail polish",
-        "perfume","mehendi","bindi","compact","primer","contour","bronzer"]),
-    ("ShopsyGrooming",["shampoo","conditioner","hair oil","face wash","moisturizer","serum",
-        "sunscreen","body wash","scrub","toner","skincare","skin care","facewash","lotion",
-        "face cream","body lotion","hair mask","hair serum","vitamin c","niacinamide",
-        "retinol","hyaluronic","micellar","cleansing","face mist","hair care"]),
-    ("ShopsyPersonalHealthCare",["trimmer","hair dryer","straightener","curler","epilator",
-        "massager","weighing scale","bp monitor","thermometer","glucometer","nebulizer",
-        "hair styler","shaver","electric toothbrush","water flosser","facial steamer"]),
-    ("ShopsyAudio",["earphone","earbuds","headphone","bluetooth speaker","tws","airpods",
-        "neckband","soundbar","wired earphone","gaming headset","noise cancelling",
-        "anc headphone","true wireless","wireless earphone"]),
-    ("ShopsyMobileProtection",["phone case","back cover","screen guard","tempered glass",
-        "mobile cover","phone cover","case cover","camera protector"]),
-    ("ShopsyRestOfMobileAccessory",["charger","charging cable","power bank","mobile holder",
-        "selfie stick","data cable","fast charger","usb cable","type c","wireless charger"]),
-    ("ShopsyHomeDecor",["candle","diya","pooja","wall decor","showpiece","wall clock","vase",
-        "painting","fairy lights","led strip","home decor","artificial flower","idol","lamp",
-        "wall hanging","dream catcher","photo frame","decorative","rangoli"]),
-    ("ShopsyHouseHold",["pressure cooker","kadhai","tawa","container","lunch box",
-        "water bottle","flask","cookware","utensil","chopper","kitchen tool","non stick",
-        "casserole","dinner set"]),
-    ("ShopsyHomeFurnishing",["bedsheet","pillow cover","curtain","blanket","towel",
-        "mattress","cushion cover","carpet","rug","bath mat","bed cover","duvet","quilt"]),
-    ("ShopsySportFitness",["yoga mat","dumbbell","resistance band","gym wear","fitness",
-        "cricket","badminton","football","cycling","workout","exercise","skipping rope",
-        "gym bag","ab roller","protein shaker"]),
-    ("ShopsyKidClothing",["kids wear","kids clothes","baby clothes","boy shirt","girl dress",
-        "infant","kids tshirt","kids kurta","kids jacket","school uniform","children"]),
-    ("ShopsyToysAndSS",["toy","puzzle","board game","stationery","crayon","art kit",
-        "stuffed toy","lego","craft","playdoh","slime","fidget","pop it"]),
-    ("ShopsyBabyCare",["diaper","baby food","baby oil","baby shampoo","baby soap",
-        "stroller","feeding bottle","baby care","baby powder","teether","baby lotion"]),
-    ("ShopsyLuggageAndTravelAccessories",["handbag","backpack","sling bag","tote bag",
-        "travel bag","suitcase","purse","wallet","clutch","laptop bag","school bag",
-        "duffle bag","college bag","office bag"]),
-    ("ShopsyFashionWearables",["jewellery","jewelry","earring","necklace","bracelet",
-        "ring","bangle","watch","sunglasses","belt","chain","pendant","anklet",
-        "mangalsutra","maang tikka"]),
-    ("ShopsyFootwear",["shoes","sandals","heels","sneakers","boots","slippers","chappal",
-        "loafers","flip flops","sports shoes","formal shoes","wedges","bellies","jutti"]),
-    ("ShopsyCoreEA",["mixer grinder","juicer","iron box","electric kettle","toaster",
-        "induction","roti maker","sandwich maker","air fryer","electric cooker",
-        "hand blender","food processor"]),
-    ("ShopsyHealthCare",["protein supplement","vitamin","ayurvedic","immunity","probiotic",
-        "whey protein","health drink","weight loss","detox","collagen","multivitamin",
-        "omega","ashwagandha","protein bar"]),
-    ("ShopsyIOT",["smartwatch","smart band","smart home","alexa","google home",
-        "smart lighting","fitness band","wearable","smart switch","smart bulb"]),
-    ("ShopsyCamera",["ring light","gimbal","gopro","dslr","camera lens","photography",
-        "selfie light","action camera","tripod","vlog setup"]),
-    ("ShopsyMensClothingEssentialsAndEthnic",["men kurta","men sherwani","dhoti",
-        "men ethnic","bandhgala","nehru jacket","men festive"]),
-    ("ShopsyMensClothingCasualTopwear",["men tshirt","men shirt","polo shirt","men hoodie",
-        "men sweatshirt","men jacket","men casual","men fashion","men outfit","men wear"]),
-    ("ShopsyFoodAndNutrition",["healthy snack","oats","muesli","honey","ghee","dry fruits",
-        "nuts","seeds","superfood","health food","organic food"]),
-    ("ShopsyHouseHoldSupplies",["detergent","washing powder","dishwash","floor cleaner",
-        "toilet cleaner","insect repellent","garbage bag","fabric softener","disinfectant"]),
+# ── BU CLASSIFIER (From Reference Code) ───────────────────────────────────────
+_BU_RULES = [
+    ("Not A Product Video", re.compile(
+        r"\b(news|politics|cricket|football|movie|song|music|dance|comedy|"
+        r"meme|travel vlog|festival|wedding|birthday|baby shower|graduation|"
+        r"motivation|finance|stock|crypto|recipe|cook|chef)\b", re.I)),
+    ("Electronics", re.compile(
+        r"\b(phone|mobile|laptop|tablet|ipad|iphone|samsung|redmi|oneplus|"
+        r"realme|vivo|oppo|headphone|earphone|earbuds|speaker|charger|cable|"
+        r"powerbank|power bank|camera|smartwatch|smart watch|led|tv|television|"
+        r"router|wifi|keyboard|mouse|monitor|printer|gadget|electronics)\b", re.I)),
+    ("BPC", re.compile(
+        r"\b(skincare|skin care|serum|moisturizer|sunscreen|spf|face wash|"
+        r"facewash|toner|foundation|lipstick|lip gloss|mascara|eyeliner|"
+        r"blush|concealer|makeup|beauty|perfume|deodorant|shampoo|conditioner|"
+        r"hair oil|hair care|haircare|nail|bpc|cosmetic|lotion|cream|"
+        r"face pack|face mask|vitamin c|retinol|niacinamide|hyaluronic)\b", re.I)),
+    ("Women+Kids Apparel", re.compile(
+        r"\b(kurti|kurta|saree|sari|lehenga|salwar|dupatta|anarkali|"
+        r"ethnic wear|ethnic|women.s wear|ladies|girls|kids wear|children.s|"
+        r"baby clothes|frock|dress|blouse|women top|tunics|palazzo)\b", re.I)),
+    ("Men Apparel", re.compile(
+        r"\b(men.s wear|mens|shirt|kurta for men|sherwani|men.s shirt|"
+        r"men.s jacket|men.s jeans|men.s tshirt|t-shirt|polo|hoodie|"
+        r"sweatshirt|blazer|trousers|chinos|men.s fashion)\b", re.I)),
+    ("Footwear", re.compile(
+        r"\b(shoes|sneakers|sandals|heels|boots|footwear|slippers|loafers|"
+        r"flip flop|chappal|nike|adidas|puma|woodland|bata)\b", re.I)),
+    ("Travel & Accessory", re.compile(
+        r"\b(bag|handbag|purse|wallet|clutch|backpack|luggage|suitcase|"
+        r"trolley bag|travel bag|tote|shoulder bag|belt|watch|sunglasses|"
+        r"jewellery|jewelry|earring|necklace|ring|bracelet|accessory|accessories)\b", re.I)),
+    ("Home", re.compile(
+        r"\b(home decor|home decoration|bedsheet|pillow|curtain|sofa|"
+        r"kitchen|cookware|utensil|container|storage|organizer|lamp|"
+        r"candle|frame|mirror|carpet|rug|mat|cushion|bedding|towel|"
+        r"dining|tableware|crockery|wall art|home)\b", re.I)),
+    ("Furniture", re.compile(
+        r"\b(furniture|chair|table|desk|bed frame|wardrobe|shelf|bookshelf|"
+        r"cabinet|sofa set|couch|recliner|study table|office chair)\b", re.I)),
+    ("HAT", re.compile(
+        r"\b(hat|cap|beanie|helmet|headband|hair accessory|scrunchie|"
+        r"hair clip|hair band|turban)\b", re.I)),
+    ("GM", re.compile(
+        r"\b(toy|game|puzzle|stationery|pen|notebook|craft|art supply|"
+        r"sports|gym|fitness|yoga mat|dumbbell|cycle|bicycle|scooter|"
+        r"outdoor|camping|gardening|tools|hardware)\b", re.I)),
+    ("Large", re.compile(
+        r"\b(washing machine|refrigerator|fridge|ac |air conditioner|"
+        r"microwave|oven|dishwasher|water purifier|geyser|air purifier|"
+        r"vacuum cleaner|mixer grinder|blender|juicer|induction|large appliance)\b", re.I)),
 ]
-VERTICAL={
-    "ShopsyWomenEthnicContemporary":"Women Fashion","ShopsyWomenWesternCore":"Women Fashion",
-    "ShopsyMensClothingCasualTopwear":"Men Fashion","ShopsyMensClothingEssentialsAndEthnic":"Men Fashion",
-    "ShopsyKidClothing":"Kids Fashion","ShopsyFootwear":"Footwear",
-    "ShopsyFashionWearables":"Accessories","ShopsyLuggageAndTravelAccessories":"Bags & Luggage",
-    "ShopsyMakeupFragrances":"Beauty","ShopsyGrooming":"Beauty",
-    "ShopsyPersonalHealthCare":"Personal Care","ShopsyHealthCare":"Health",
-    "ShopsyBabyCare":"Baby","ShopsyAudio":"Electronics","ShopsyMobileProtection":"Mobile",
-    "ShopsyRestOfMobileAccessory":"Mobile","ShopsyIOT":"Electronics","ShopsyCamera":"Electronics",
-    "ShopsyHomeDecor":"Home","ShopsyHouseHold":"Home","ShopsyHomeFurnishing":"Home",
-    "ShopsyHouseHoldSupplies":"Home","ShopsyCoreEA":"Appliances",
-    "ShopsySportFitness":"Sports","ShopsyToysAndSS":"Toys","ShopsyFoodAndNutrition":"Food",
-}
 
-# Compile a consolidated broad mapping
-BROAD_MAP = {}
-for sub_cat, kws in CATS:
-    broad = VERTICAL.get(sub_cat, "Other")
-    if broad not in BROAD_MAP:
-        BROAD_MAP[broad] = []
-    BROAD_MAP[broad].extend(kws)
-
-def classify_broad(text: str):
-    """Classify based on description/title into broad categories."""
-    if not text: return "Other"
-    tl = text.lower()
-    for broad, kws in BROAD_MAP.items():
-        for kw in kws:
-            # use regex word boundary to prevent partial matches (e.g., 'ear' matching 'bear')
-            if re.search(r'\b' + re.escape(kw) + r'\b', tl):
-                return broad
+def classify_bu(title: str) -> str:
+    if not title: return "Other"
+    for bu, pat in _BU_RULES:
+        if pat.search(title): return bu
     return "Other"
 
 # ── DATA ──────────────────────────────────────────────────────────────────────
@@ -140,7 +97,6 @@ BASE_TAGS=["tiktokmademebuyit","instamademebuyit","musthave","viralproduct","jus
     "hairtransformation","fitnessmotivation","gadgetreview","techunboxing",
     "homedecorinspo","kitchenhacks","meeshohaul","flipkartfinds"]
 DATA_FILE="social_trends_data.json"
-TRENDS_FILE="trends_history.json"
 
 def load_data():
     if not os.path.exists(DATA_FILE): return []
@@ -155,61 +111,44 @@ def save_data(records):
             by_url[url]=r
     json.dump(list(by_url.values()),open(DATA_FILE,"w"),ensure_ascii=False,indent=2)
 
-def load_trends_history():
-    if not os.path.exists(TRENDS_FILE): return []
-    try: return json.load(open(TRENDS_FILE))
-    except: return []
-
-def save_trends_snapshot(items):
-    history=load_trends_history()
-    history.append({"fetched_at":datetime.now().isoformat(),"items":items})
-    json.dump(history[-2160:],open(TRENDS_FILE,"w"),ensure_ascii=False,indent=2)
-
-# ── GOOGLE TRENDS ─────────────────────────────────────────────────────────────
-@st.cache_data(ttl=1800)
-def fetch_trends_live():
-    try:
-        r=_req.get("https://trends.google.com/trending/rss?geo=IN",timeout=8)
-        items=re.findall(r"<title><!\[CDATA\[(.+?)\]\]></title>",r.text)
-        traffic=re.findall(r"<hn:approx_traffic>(.+?)</hn:approx_traffic>",r.text)
-        result=[{"topic":t.strip(),"vol":traffic[i].replace("+","") if i<len(traffic) else "",
-                 "fetched_at":datetime.now().isoformat()}
-                for i,t in enumerate(items[:20]) if t.strip()]
-        if result: save_trends_snapshot(result)
-        return result
-    except: return []
-
-# ── SCRAPER ────────────────────────────────────────────────────────────────────
-def pn(s):
+# ── PARSERS (From Reference Code) ──────────────────────────────────────────────
+def parse_num(s):
     if not s: return None
-    s=str(s).strip()
-    for pat,mul in [(r"([\d.]+)\s*crore",10_000_000),(r"([\d.]+)\s*lakh",100_000)]:
-        m=re.search(pat,s,re.I)
+    s = str(s).strip()
+    for pat, mul in [
+        (r"([\d.]+)\s*crore", 10_000_000),
+        (r"([\d.]+)\s*lakh",  100_000),
+        (r"([\d.]+)\s*thousand", 1_000),
+    ]:
+        m = re.search(pat, s, re.I)
         if m:
-            try: return int(float(m.group(1))*mul)
+            try: return int(float(m.group(1)) * mul)
             except: pass
-    s2=s.upper().replace(",","")
-    m=re.search(r"([\d.]+)\s*([KMB]?)",s2)
+    s2 = s.upper().replace(",","").replace("(","").replace(")","")
+    m = re.search(r"([\d.]+)\s*([KMB]?)", s2)
     if not m: return None
-    try: return int(float(m.group(1))*{"K":1000,"M":1_000_000,"B":1_000_000_000}.get(m.group(2),1))
+    try:
+        n = float(m.group(1))
+        return int(n * {"K":1000,"M":1_000_000,"B":1_000_000_000}.get(m.group(2),1))
     except: return None
 
-def fu(domain,link):
+def fmt(domain, link):
     if not link: return ""
-    link=link.strip()
+    link = link.strip()
     if link.startswith("http"): return link
     return f"{domain}{link}" if link.startswith("/") else f"{domain}/{link}"
 
+# ── SCRAPERS ──────────────────────────────────────────────────────────────────
 async def scrape_ig(ctx, tag, limit=15):
     rows=[]
     reel_urls=[]; page=await ctx.new_page()
     try:
-        await page.goto(f"https://www.instagram.com/explore/tags/{tag}/",
-            wait_until="domcontentloaded",timeout=25000)
+        await page.goto(f"https://www.instagram.com/explore/tags/{tag}/", wait_until="domcontentloaded", timeout=25000)
         await asyncio.sleep(4)
         if "login" in page.url or "accounts" in page.url:
             return rows
 
+        # Click recent tab
         for recent_sel in ["span:text-is('Recent')", "div[role='tab']:has-text('Recent')", "a[href*='recent']"]:
             try:
                 tab=page.locator(recent_sel).first
@@ -222,81 +161,61 @@ async def scrape_ig(ctx, tag, limit=15):
         for _ in range(5):
             await page.evaluate("window.scrollBy(0,1500)")
             await asyncio.sleep(0.8)
+            
         links=await page.locator("a[href*='/reel/'],a[href*='/p/']").all()
         seen_u=set()
         for el in links[:limit*2]:
             href=await el.get_attribute("href")
             if href and href not in seen_u:
                 seen_u.add(href)
-                reel_urls.append(fu("https://www.instagram.com",href))
+                reel_urls.append(fmt("https://www.instagram.com",href))
     except: pass
     finally:
         try: await page.close()
         except: pass
 
-    # Open each reel page for robust metadata extraction
+    # Open each reel page - using exact reference code regex strategy
     for url in reel_urls[:limit]:
         rp=await ctx.new_page()
-        views=likes=creator=thumb=desc_text=posted_on=None; title=""
+        views=likes=creator=thumb=desc_text=posted_on=None
+        title=""
         try:
-            await rp.goto(url,wait_until="domcontentloaded",timeout=18000)
+            await rp.goto(url, wait_until="domcontentloaded", timeout=18000)
             await asyncio.sleep(2) 
             html=await rp.content()
 
-            # 1. Primary Extraction: JSON-LD (SEO Schema)
-            schema_m = re.search(r'<script type="application/ld\+json">(.+?)</script>', html, re.S)
-            if schema_m:
-                try:
-                    import json as _json
-                    schema = _json.loads(schema_m.group(1))
-                    if isinstance(schema, list): schema = schema[0]
-                    
-                    posted_on = schema.get('uploadDate', posted_on)
-                    desc_text = schema.get('description', desc_text)
-                    title = schema.get('name', title)
-                    if 'author' in schema and isinstance(schema['author'], dict):
-                        creator = "@" + schema['author'].get('alternateName', '')
-                    
-                    if 'interactionStatistic' in schema:
-                        for stat in schema['interactionStatistic']:
-                            if 'WatchAction' in stat.get('interactionType', ''):
-                                views = stat.get('userInteractionCount', views)
-                            elif 'LikeAction' in stat.get('interactionType', ''):
-                                likes = stat.get('userInteractionCount', likes)
-                except: pass
+            # Views/Likes using Reference Code logic
+            og = re.search(r'og:description[^>]*content="([^"]*)"', html, re.I)
+            if og:
+                desc = og.group(1)
+                vm = re.search(r"([\d,\.]+(?:[\s\u00a0]+(?:crore|lakh))?[KMB]?)\s*(?:views?|plays?)", desc, re.I)
+                if vm: views = parse_num(vm.group(1).strip())
+                lm = re.search(r"([\d,\.]+[KMB]?)\s*likes?", desc, re.I)
+                if lm: likes = parse_num(lm.group(1).strip())
+                
+                # Extract creator and description from og tag
+                cap = re.search(r"(@[\w\.]+):\s*(.{5,})", desc, re.S)
+                if cap:
+                    creator = cap.group(1)
+                    desc_text = cap.group(2).strip()[:200]
 
-            # 2. Time Tag Extraction (Captures the actual date behind the "3w" in the UI)
+            # Title extraction using Reference Code logic
+            t_tag = re.search(r"<title>([^<]+)</title>", html, re.I)
+            if t_tag:
+                t = re.sub(r"\s*[•·|]\s*Instagram.*$", "", t_tag.group(1)).strip()
+                if len(t) > 5: title = t[:200]
+
+            # Accurate Date Extraction (missing from reference script, explicitly added for time tabs)
+            time_m = re.search(r'<time[^>]+datetime="([^"]+)"', html, re.I)
+            if time_m:
+                posted_on = time_m.group(1)
             if not posted_on:
-                time_m = re.search(r'<time[^>]+datetime="([^"]+)"', html, re.I)
-                if time_m: posted_on = time_m.group(1)
+                ts_m = re.search(r'<meta\s+property="article:published_time"\s+content="([^"]+)"', html, re.I)
+                if ts_m: posted_on = ts_m.group(1)
 
-            # 3. Fallbacks
-            if not views:
-                vm=re.search(r'"video_view_count"\s*:\s*"?(\d+)"?',html)
-                if vm: views = int(vm.group(1))
-                else:
-                    vm2=re.search(r'([\d,\.]+(?:[\s\u00a0]+(?:crore|lakh))?[KMB]?)\s*(?:views?|plays?)', html, re.I)
-                    if vm2: views = pn(vm2.group(1))
-            if not likes:
-                lm=re.search(r'"like_count"\s*:\s*"?(\d+)"?',html)
-                if lm: likes = int(lm.group(1))
-            
-            # Robust Thumbnail extraction
-            if not thumb:
-                # Try internal display_url first, fallback to og:image
-                img_json = re.search(r'"display_url"\s*:\s*"([^"]+)"', html)
-                if img_json: 
-                    thumb = img_json.group(1).replace("\\u0026", "&")
-                else:
-                    img_m=re.search(r'<meta\s+property="og:image"\s+content="([^"]+)"',html)
-                    if img_m: thumb = img_m.group(1).replace("&amp;", "&")
-
-            if not desc_text:
-                desc_m=re.search(r'<meta\s+property="og:description"\s+content="([^"]+)"',html)
-                if desc_m:
-                    d = desc_m.group(1)
-                    cap=re.search(r"@[\w\.]+:\s*(.{5,})",d,re.S)
-                    if cap: desc_text=cap.group(1).strip()[:200]
+            # Thumbnail fallback
+            img_m = re.search(r'<meta\s+property="og:image"\s+content="([^"]+)"', html, re.I)
+            if img_m: thumb = img_m.group(1).replace("&amp;", "&")
 
         except: pass
         finally:
@@ -304,30 +223,26 @@ async def scrape_ig(ctx, tag, limit=15):
             except: pass
 
         if not title: title=f"#{tag} reel"
-        own_uid=IG_SESSIONID.split("%")[0] if IG_SESSIONID else ""
-        if own_uid and creator and own_uid in creator.replace("@",""):
-            continue
-            
-        # Classify broadly using BOTH title and description
-        broad_cat = classify_broad(f"{title} {desc_text or ''} {tag}")
+        
+        # BU Classification utilizing title + description
+        bu_cat = classify_bu(f"{title} {desc_text or ''} {tag}")
         
         rows.append({
-            "platform":"Instagram","content_type":"Reel",
-            "hashtag":f"#{tag}","url":url,"title":title.replace('\n', ' '),
-            "description":desc_text.replace('\n', ' ') if desc_text else "","creator":creator or "","thumbnail":thumb or "",
-            "posted_on":posted_on or "","views":views,"likes":likes,
-            "engagement":views or likes or 0,"category":broad_cat,
+            "platform":"Instagram", "content_type":"Reel",
+            "hashtag":f"#{tag}", "url":url, "title":title.replace('\n', ' '),
+            "description":desc_text.replace('\n', ' ') if desc_text else "", "creator":creator or "", "thumbnail":thumb or "",
+            "posted_on":posted_on or "", "views":views, "likes":likes,
+            "engagement":views or likes or 0, "category":bu_cat,
             "scraped_at":datetime.now().isoformat(),
         })
 
-    rows.sort(key=lambda x:x.get("posted_on","") or "",reverse=True)
+    rows.sort(key=lambda x:x.get("posted_on","") or "", reverse=True)
     return rows[:limit]
 
 async def scrape_yt(ctx, tag, limit=25):
     rows=[]; page=await ctx.new_page()
     try:
-        await page.goto(f"https://www.youtube.com/results?search_query=%23{tag}&sp=CAI%3D",
-            wait_until="domcontentloaded",timeout=25000)
+        await page.goto(f"https://www.youtube.com/results?search_query=%23{tag}&sp=CAI%3D", wait_until="domcontentloaded", timeout=25000)
         await asyncio.sleep(3)
         prev=0
         for _ in range(5):
@@ -336,34 +251,38 @@ async def scrape_yt(ctx, tag, limit=25):
             vids=await page.query_selector_all("ytd-video-renderer,ytd-rich-item-renderer")
             if len(vids)>=limit or len(vids)==prev: break
             prev=len(vids)
+            
         vids=await page.query_selector_all("ytd-video-renderer,ytd-rich-item-renderer")
         for v in vids[:limit]:
             t_el=await v.query_selector("#video-title,a#video-title")
             if not t_el: continue
             title=(await t_el.inner_text()).strip()
             if not title: continue
+            
+            # Views extraction using Reference Code logic
             views=None
             for span in await v.query_selector_all("#metadata-line span"):
                 st2=(await span.inner_text()).strip()
-                vm=re.search(r"([\d,\.]+(?:[\s\u00a0]+(?:crore|lakh))?[KMB]?)\s*views?",st2,re.I)
-                if vm: views=pn(vm.group(1).strip()); break
+                vm=re.search(r"([\d,\.]+(?:[\s\u00a0]+(?:crore|lakh))?[KMB]?)\s*views?", st2, re.I)
+                if vm: views = parse_num(vm.group(1).strip()); break
             if not views:
-                aria=await t_el.get_attribute("aria-label") or ""
-                vm2=re.search(r"([\d,\.]+[KMB]?)\s*views?",aria,re.I)
-                if vm2: views=pn(vm2.group(1))
+                aria = await t_el.get_attribute("aria-label") or ""
+                vm2 = re.search(r"([\d,\.]+(?:[\s\u00a0]+(?:crore|lakh))?[KMB]?)\s*views?", aria, re.I)
+                if vm2: views = parse_num(vm2.group(1).strip())
             
+            # Date extraction
             posted_on=""
             for span in await v.query_selector_all("#metadata-line span"):
                 st2=(await span.inner_text()).strip()
-                m2=re.search(r"(\d+)\s*(second|minute|hour|day|week|month|year)s?\s*ago",st2,re.I)
+                m2=re.search(r"(\d+)\s*(second|minute|hour|day|week|month|year)s?\s*ago", st2, re.I)
                 if m2:
                     n2=int(m2.group(1)); unit=m2.group(2).lower()
-                    delta_map={"second":1,"minute":60,"hour":3600,"day":86400,
-                               "week":604800,"month":2592000,"year":31536000}
+                    delta_map={"second":1,"minute":60,"hour":3600,"day":86400, "week":604800,"month":2592000,"year":31536000}
                     secs=n2*delta_map.get(unit,86400)
                     approx=datetime.now()-timedelta(seconds=secs)
                     posted_on=approx.isoformat()
                     break
+                    
             ch=await v.query_selector("#channel-name a,ytd-channel-name a")
             channel=(await ch.inner_text()).strip() if ch else ""
             href=await t_el.get_attribute("href") or ""
@@ -378,16 +297,15 @@ async def scrape_yt(ctx, tag, limit=25):
             vid_id=vid_m.group(1) if vid_m else ""
             thumb=f"https://img.youtube.com/vi/{vid_id}/mqdefault.jpg" if vid_id else ""
             
-            broad_cat = classify_broad(f"{title} {tag}")
+            bu_cat = classify_bu(f"{title} {tag}")
             
             rows.append({
-                "platform":"YouTube","content_type":"Shorts" if is_s else "Video",
-                "hashtag":f"#{tag}","url":fu("https://www.youtube.com",href),
-                "title":title,"description":"","creator":channel,
-                "thumbnail":thumb,"vid_id":vid_id,
-                "posted_on":posted_on,
-                "views":views,"likes":None,"engagement":views or 0,
-                "category":broad_cat,
+                "platform":"YouTube", "content_type":"Shorts" if is_s else "Video",
+                "hashtag":f"#{tag}", "url":fmt("https://www.youtube.com",href),
+                "title":title, "description":"", "creator":channel,
+                "thumbnail":thumb, "vid_id":vid_id,
+                "posted_on":posted_on, "views":views, "likes":None,
+                "engagement":views or 0, "category":bu_cat,
                 "scraped_at":datetime.now().isoformat(),
             })
         rows.sort(key=lambda x:x.get("views") or 0,reverse=True)
@@ -404,8 +322,7 @@ async def _run_all(hashtags,platforms,per_tag,progress_cb):
         total=len(hashtags); done=0
         for i in range(0,total,BATCH):
             batch=hashtags[i:i+BATCH]
-            results=await asyncio.gather(*[_scrape_one(pw,t,platforms,per_tag) for t in batch],
-                                         return_exceptions=True)
+            results=await asyncio.gather(*[_scrape_one(pw,t,platforms,per_tag) for t in batch], return_exceptions=True)
             for r in results:
                 if isinstance(r,list): all_records.extend(r)
             done+=len(batch)
@@ -415,8 +332,7 @@ async def _run_all(hashtags,platforms,per_tag,progress_cb):
 async def _scrape_one(pw,tag,platforms,per_tag):
     rows=[]
     args=["--disable-blink-features=AutomationControlled","--no-sandbox","--disable-gpu",
-          "--ignore-certificate-errors","--disable-dev-shm-usage","--disable-setuid-sandbox",
-          "--no-zygote","--mute-audio"]
+          "--ignore-certificate-errors","--disable-dev-shm-usage","--disable-setuid-sandbox", "--no-zygote","--mute-audio"]
     try: browser=await pw.chromium.launch(headless=True,args=args)
     except:
         args.append("--single-process")
@@ -471,7 +387,7 @@ if "init" not in st.session_state:
     st.session_state.sel_plats=["Instagram","YouTube"]
     st.session_state.per_tag=10
     st.session_state.sort_mode="Engagement ↓"
-    st.session_state.playing=None   # card_id currently playing
+    st.session_state.playing=None
 
 # ── STYLES ────────────────────────────────────────────────────────────────────
 st.markdown("""
@@ -498,8 +414,8 @@ st.markdown("""
 .tv{font-size:9px;color:#94a3b8;margin-left:2px;}
 </style>""",unsafe_allow_html=True)
 
-st.markdown('<div class="hero"><div class="hero-t">📱 Social Trend Tracker · Broad Categories</div>'
-            '<div class="hero-s">Instagram + YouTube · Auto-classified from description</div></div>',
+st.markdown('<div class="hero"><div class="hero-t">📱 Social Trend Tracker · BU Categories</div>'
+            '<div class="hero-s">Instagram + YouTube · Auto-classified using BU Rules</div></div>',
             unsafe_allow_html=True)
 
 # ── SIDEBAR (sticky) ──────────────────────────────────────────────────────────
@@ -555,7 +471,6 @@ if scrape_btn and sel_tags:
 
 all_data=load_data()
 sel_ht={f"#{t}" for t in sel_tags}
-trends_live=fetch_trends_live()
 
 if not all_data:
     st.info("No data. Select hashtags → Scrape."); st.stop()
@@ -569,16 +484,17 @@ if "hashtag" not in df.columns: df["hashtag"]=""
 if "category" not in df.columns: df["category"]="Other"
 if "content_type" not in df.columns: df["content_type"]=""
 if "posted_on" not in df.columns: df["posted_on"]=""
-# NO fallback to scraped_at to protect Time Tabs
+# Accurate extracted date logic for the UI tabs
 df["uploaded_at"]=pd.to_datetime(df["posted_on"],errors="coerce")
 
 df_sel=df[df["hashtag"].isin(sel_ht)].copy()
 if df_sel.empty: df_sel=df.copy()
 
+# ── VIEW FILTERS (Vertical Completely Removed) ────────────────────────────────
 st.markdown("---")
-# Single Broad Category filter replaces the two-dropdown setup
+# Single Category filter based on BU Rules
 cat_opts=["All"]+sorted(df_sel["category"].unique())
-cf_val=st.selectbox("Filter by Category",cat_opts,key="gfc")
+cf_val=st.selectbox("Filter by Category (BU)", cat_opts, key="gfc")
 
 dff=df_sel.copy()
 if sel_plats: dff=dff[dff["platform"].isin(sel_plats)]
