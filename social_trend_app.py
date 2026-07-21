@@ -591,10 +591,10 @@ if "uploaded_at" not in df_sel.columns:
 st.markdown("---")
 fc1,fc2=st.columns(2)
 with fc1:
-    cat_opts=["All"]+sorted(df_sel["category"].unique())
+    cat_opts=["All"]+sorted(df_sel["category"].dropna().unique().tolist())
     cf_val=st.selectbox("Filter by Category",cat_opts,key="gfc")
 with fc2:
-    vert_opts=["All"]+sorted(df_sel["vertical"].unique())
+    vert_opts=["All"]+sorted(df_sel["vertical"].dropna().unique().tolist())
     vf_val=st.selectbox("Filter by Vertical",vert_opts,key="gfv")
 
 dff=df_sel.copy()
