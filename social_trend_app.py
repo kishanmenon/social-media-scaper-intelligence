@@ -1,9 +1,10 @@
 """
-social_trend_app.py v13
-Key fixes (Strict adherence to scrape_reels_to_excel.py):
-- Instagram scraper explicitly pulls 'alt' and 'src' from the grid to guarantee text and thumbnails are captured.
-- Uses the exact bidirectional regex logic from the reference script to parse views/likes from og:description.
-- Removed all "BU" variables/references, strictly enforcing "Category" naming.
+social_trend_app.py v14
+Key fixes:
+- Shifted all DOM extraction to pure JavaScript (`page.evaluate`) to bypass Playwright locator sync failures.
+- Captures Grid thumbnails and descriptions instantly via JS.
+- Captures Reel page meta tags (og:description, og:image, article:published_time) instantly via JS.
+- Strictly categorizes using your exact BU keyword mapping.
 """
 import streamlit as st
 import asyncio, sys, os, re, json, threading, subprocess, time, io
@@ -136,7 +137,7 @@ def fmt(domain, link):
     if link.startswith("http"): return link
     return f"{domain}{link}" if link.startswith("/") else f"{domain}/{link}"
 
-# ── SCRAPERS (Implementing exact reference script logic) ──────────────────────
+# ── SCRAPERS ──────────────────────────────────────────────────────────────────
 async def scrape_ig(ctx, tag, limit=15):
     rows = []
     page = await ctx.new_page()
@@ -144,6 +145,7 @@ async def scrape_ig(ctx, tag, limit=15):
     try:
         await page.goto(f"https://www.instagram.com/explore/tags/{tag}/", wait_until="domcontentloaded", timeout=25000)
         await asyncio.sleep(4)
+        
         if "login" in page.url or "accounts" in page.url:
             return rows
 
@@ -151,30 +153,35 @@ async def scrape_ig(ctx, tag, limit=15):
             await page.evaluate("window.scrollBy(0,1200)")
             await asyncio.sleep(0.8)
 
-        # EXACT reference script grid extraction logic to guarantee thumbnails and initial texts
-        links = await page.locator("a[href*='/reel/'], a[href*='/p/']").all()
+        # 1. Pure JS Grid Extraction
+        grid_items = await page.evaluate('''() => {
+            let items = [];
+            document.querySelectorAll('a[href*="/p/"], a[href*="/reel/"]').forEach(a => {
+                let img = a.querySelector('img');
+                items.push({
+                    href: a.getAttribute('href'),
+                    alt: img ? img.getAttribute('alt') : '',
+                    src: img ? img.getAttribute('src') : ''
+                });
+            });
+            return items;
+        }''')
+
         seen_u = set()
-        for el in links[:limit*2]:
-            href = await el.get_attribute("href")
+        for item in grid_items:
+            href = item.get("href")
             if not href or href in seen_u: continue
             seen_u.add(href)
             
-            img_el = el.locator("img").first
-            grid_alt = ""
-            grid_thumb = ""
-            if await img_el.count():
-                grid_alt = (await img_el.get_attribute("alt")) or ""
-                grid_thumb = (await img_el.get_attribute("src")) or ""
-                
             full_url = fmt("https://www.instagram.com", href)
-            reel_urls.append((grid_alt, grid_thumb, full_url))
+            reel_urls.append((item.get("alt") or "", item.get("src") or "", full_url))
             if len(reel_urls) >= limit: break
     except: pass
     finally:
         try: await page.close()
         except: pass
 
-    # Open each reel page to capture Engagement Metrics utilizing reference script's regex
+    # 2. Pure JS Meta Data Extraction on Individual Reel Pages
     for grid_alt, grid_thumb, url in reel_urls:
         rp = await ctx.new_page()
         views = likes = None
@@ -187,16 +194,22 @@ async def scrape_ig(ctx, tag, limit=15):
         try:
             await rp.goto(url, wait_until="domcontentloaded", timeout=18000)
             await asyncio.sleep(1.5)
-            html = await rp.content()
-
-            # EXACT Reference script views/likes parsing with bidirectional fallback
-            og_desc = None
-            og_m = re.search(r'og:description[^>]*content=["\']([^"\']*)["\']', html, re.I)
-            if og_m: og_desc = og_m.group(1)
-            else:
-                og_m2 = re.search(r'content=["\']([^"\']*)["\'][^>]*og:description', html, re.I)
-                if og_m2: og_desc = og_m2.group(1)
             
+            # Instantly pull meta tags via browser JS API
+            meta_data = await rp.evaluate('''() => {
+                let getMeta = (prop) => {
+                    let el = document.querySelector(`meta[property="${prop}"], meta[name="${prop}"]`);
+                    return el ? el.getAttribute('content') : '';
+                };
+                return {
+                    og_desc: getMeta('og:description'),
+                    og_img: getMeta('og:image'),
+                    title: document.title,
+                    pub_time: getMeta('article:published_time') || (document.querySelector('time') ? document.querySelector('time').getAttribute('datetime') : '')
+                };
+            }''')
+
+            og_desc = meta_data.get("og_desc") or ""
             if og_desc:
                 vm = re.search(r"([\d,\.]+(?:[\s\u00a0]+(?:crore|lakh))?[KMB]?)\s*(?:views?|plays?)", og_desc, re.I)
                 if vm: views = parse_num(vm.group(1).strip())
@@ -204,39 +217,24 @@ async def scrape_ig(ctx, tag, limit=15):
                 lm = re.search(r"([\d,\.]+[KMB]?)\s*likes?", og_desc, re.I)
                 if lm: likes = parse_num(lm.group(1).strip())
                 
-                # Extract creator and append to description
                 cap = re.search(r"(@[\w\.]+):\s*(.+)", og_desc, re.S)
                 if cap:
                     creator = cap.group(1)
                     if not desc_text: desc_text = cap.group(2).strip()
             
-            # EXACT Reference script title parsing
-            t_tag = re.search(r"<title>([^<]+)</title>", html, re.I)
-            if t_tag:
-                t = re.sub(r"\s*[•·|]\s*Instagram.*$", "", t_tag.group(1)).strip()
+            t = meta_data.get("title", "")
+            if t:
+                t = re.sub(r"\s*[•·|]\s*Instagram.*$", "", t).strip()
                 if len(t) > 5: title = t[:200]
 
-            # Additional fallback for Thumbnail directly from page source
-            og_img = re.search(r'og:image[^>]*content=["\']([^"\']*)["\']', html, re.I)
-            if not og_img:
-                og_img = re.search(r'content=["\']([^"\']*)["\'][^>]*og:image', html, re.I)
-            if og_img: thumb = og_img.group(1).replace("&amp;", "&")
-
-            # Fallback for Date to secure tab integration
-            ts_m = re.search(r'article:published_time[^>]*content=["\']([^"\']*)["\']', html, re.I)
-            if not ts_m:
-                ts_m = re.search(r'content=["\']([^"\']*)["\'][^>]*article:published_time', html, re.I)
-            if ts_m: posted_on = ts_m.group(1)
-            else:
-                time_m = re.search(r'<time[^>]+datetime=["\']([^"\']+)["\']', html, re.I)
-                if time_m: posted_on = time_m.group(1)
+            if meta_data.get("og_img"): thumb = meta_data["og_img"].replace("&amp;", "&")
+            if meta_data.get("pub_time"): posted_on = meta_data["pub_time"]
 
         except: pass
         finally:
             try: await rp.close()
             except: pass
 
-        # Map strictly against Category Rules
         final_cat = classify_category(f"{title} {desc_text} {tag}")
 
         rows.append({
@@ -426,7 +424,7 @@ st.markdown("""
 </style>""",unsafe_allow_html=True)
 
 st.markdown('<div class="hero"><div class="hero-t">📱 Social Trend Tracker</div>'
-            '<div class="hero-s">Instagram + YouTube · Classified Categories</div></div>',
+            '<div class="hero-s">Instagram + YouTube · Auto-classified Categories</div></div>',
             unsafe_allow_html=True)
 
 # ── SIDEBAR (sticky) ──────────────────────────────────────────────────────────
