@@ -452,13 +452,22 @@ async def _run_all(hashtags, platforms, per_tag, progress_cb):
     return all_records,discovered
 
 def run_sync(hashtags,platforms,per_tag,progress_cb=None):
-    result={}; exc=[]
+    result={}; exc=[]; progress_state={"frac":0,"msg":"Starting..."}
+    def _progress(frac, msg):
+        progress_state["frac"]=frac; progress_state["msg"]=msg
     def _t():
         loop=asyncio.new_event_loop(); asyncio.set_event_loop(loop)
-        try: result["r"]=loop.run_until_complete(_run_all(hashtags,platforms,per_tag,progress_cb))
+        try: result["r"]=loop.run_until_complete(_run_all(hashtags,platforms,per_tag,_progress))
         except Exception as e: exc.append(e)
         finally: loop.close()
-    t=threading.Thread(target=_t,daemon=True); t.start(); t.join(timeout=600)
+    t=threading.Thread(target=_t,daemon=True); t.start()
+    import time
+    while t.is_alive():
+        if progress_cb:
+            try: progress_cb(progress_state["frac"], progress_state["msg"])
+            except: pass
+        time.sleep(1)
+    t.join(timeout=10)
     if exc: raise exc[0]
     return result.get("r",([],[]))
 
