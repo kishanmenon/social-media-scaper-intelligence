@@ -1,0 +1,4 @@
+streamlit
+playwright==1.49.0
+pandas
+playwright-stealth
