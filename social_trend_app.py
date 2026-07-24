@@ -2,9 +2,10 @@
 social_trend_app.py
 Unified Hashtag Scraper & Trend Tracker:
 - Instagram: Playwright grid discovery + GraphQL POST metadata extraction (doc_id=24368985919464652).
-- YouTube: Playwright hashtag search & element metadata extraction.
-- Classification: Keyword regex categorization.
-- UI: Streamlit grid display, time window tabs (L30/L7/24h/Lifetime), export CSV, and sort options.
+- YouTube: Deep Playwright hashtag search & element metadata extraction.
+- Custom Tags: Comma-separated tag support with dynamic multiselect option synchronization.
+- Concurrency: Session-isolated data handling for multi-user scaling.
+- UI: Streamlit grid display, time window tabs (L30/L7/24h/Lifetime), export CSV, and sorting.
 """
 import streamlit as st
 import asyncio, sys, os, re, json, threading, subprocess, time, io
@@ -13,7 +14,7 @@ from urllib.parse import quote
 import requests
 import pandas as pd
 
-st.set_page_config(page_title="Trend Tracker", page_icon="📱", layout="wide")
+st.set_page_config(page_title="Trend Tracker Pro", page_icon="📱", layout="wide")
 
 # ── INSTALL CHROMIUM ──────────────────────────────────────────────────────────
 @st.cache_resource
@@ -117,24 +118,22 @@ def fmt(domain, link):
     if link.startswith("http"): return link
     return f"{domain}{link}" if link.startswith("/") else f"{domain}/{link}"
 
-# ── DATA STORAGE ──────────────────────────────────────────────────────────────
-DATA_FILE = "social_trends_data.json"
+# ── SESSION-ISOLATED DATA MANAGEMENT ──────────────────────────────────────────
+def get_user_records():
+    if "user_records" not in st.session_state:
+        st.session_state.user_records = []
+    return st.session_state.user_records
 
-def load_data():
-    if not os.path.exists(DATA_FILE): return []
-    try: return json.load(open(DATA_FILE))
-    except Exception: return []
-
-def save_data(records):
-    by_url = {}
-    for r in records:
-        url = r.get("url", "")
-        if url: by_url[url] = r
-    json.dump(list(by_url.values()), open(DATA_FILE, "w"), ensure_ascii=False, indent=2)
+def save_user_records(new_records):
+    existing = get_user_records()
+    by_url = {r["url"]: r for r in existing if r.get("url")}
+    for r in new_records:
+        if r.get("url"):
+            by_url[r["url"]] = r
+    st.session_state.user_records = list(by_url.values())
 
 # ── INSTAGRAM GRAPHQL METADATA QUERY ─────────────────────────────────────────
 def fetch_ig_metadata_graphql(shortcode: str, tag: str):
-    """Executes direct GraphQL POST query to obtain exact reel metadata"""
     variables = json.dumps({"shortcode": shortcode})
     encoded_variables = quote(variables)
 
@@ -165,7 +164,7 @@ def fetch_ig_metadata_graphql(shortcode: str, tag: str):
     }
 
     try:
-        res = requests.post("https://www.instagram.com/graphql/query", headers=headers, data=payload, timeout=12)
+        res = requests.post("https://www.instagram.com/graphql/query", headers=headers, data=payload, timeout=8)
         if res.status_code != 200: return None
         data = res.json()
         items = data.get("data", {}).get("xdt_api__v1__media__shortcode__web_info", {}).get("items", [])
@@ -208,18 +207,17 @@ def fetch_ig_metadata_graphql(shortcode: str, tag: str):
         }
     except Exception: return None
 
-# ── INSTAGRAM PLAYWRIGHT GRID DISCOVERY ────────────────────────────────────────
-async def scrape_ig(ctx, tag, limit=15):
+# ── DEEP INFINITE SCROLL SCRAPER (INSTAGRAM) ──────────────────────────────────
+async def scrape_ig_deep(ctx, tag, limit=100, cb=None):
     page = await ctx.new_page()
-    items_scraped = []
-    found_urls = []
+    found_reels = []
+    seen_codes = set()
     
     try:
-        await page.goto(f"https://www.instagram.com/explore/tags/{tag}/", wait_until="domcontentloaded", timeout=25000)
-        await asyncio.sleep(4)
+        await page.goto(f"https://www.instagram.com/explore/tags/{tag}/", wait_until="domcontentloaded", timeout=30000)
+        await asyncio.sleep(3)
         
         if "login" not in page.url and "accounts" not in page.url:
-            # Click Recent tab if present
             for recent_sel in ["span:text-is('Recent')", "div[role='tab']:has-text('Recent')", "a[href*='recent']"]:
                 try:
                     tab = page.locator(recent_sel).first
@@ -229,40 +227,51 @@ async def scrape_ig(ctx, tag, limit=15):
                         break
                 except Exception: continue
 
-            # Scroll grid to reveal reels
-            for _ in range(5):
-                await page.evaluate("window.scrollBy(0, 1500)")
-                await asyncio.sleep(0.8)
+            max_scroll_attempts = max(15, limit // 3)
+            no_new_items_count = 0
+            
+            for scroll_idx in range(max_scroll_attempts):
+                await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                await asyncio.sleep(1.2)
 
-            links = await page.locator("a[href*='/reel/'], a[href*='/p/']").all()
-            seen_codes = set()
-            for el in links:
-                href = await el.get_attribute("href")
-                if not href: continue
-                m = re.search(r"/(?:reel|p)/([^/?#]+)", href)
-                if m:
-                    code = m.group(1)
-                    if code not in seen_codes:
-                        seen_codes.add(code)
-                        
-                        img_el = el.locator("img").first
-                        alt = (await img_el.get_attribute("alt") if await img_el.count() else "") or ""
-                        src = (await img_el.get_attribute("src") if await img_el.count() else "") or ""
-                        
-                        found_urls.append((code, alt, src))
-                        if len(found_urls) >= limit: break
+                links = await page.locator("a[href*='/reel/'], a[href*='/p/']").all()
+                initial_count = len(seen_codes)
+                
+                for el in links:
+                    href = await el.get_attribute("href")
+                    if not href: continue
+                    m = re.search(r"/(?:reel|p)/([^/?#]+)", href)
+                    if m:
+                        code = m.group(1)
+                        if code not in seen_codes:
+                            seen_codes.add(code)
+                            img_el = el.locator("img").first
+                            alt = (await img_el.get_attribute("alt") if await img_el.count() else "") or ""
+                            src = (await img_el.get_attribute("src") if await img_el.count() else "") or ""
+                            found_reels.append((code, alt, src))
+                            
+                            if len(found_reels) >= limit: break
+                
+                if cb: cb(len(found_reels), f"IG #{tag}: Found {len(found_reels)}/{limit} links...")
+                if len(found_reels) >= limit: break
+                
+                if len(seen_codes) == initial_count:
+                    no_new_items_count += 1
+                    if no_new_items_count >= 4: break
+                else:
+                    no_new_items_count = 0
+
     except Exception: pass
     finally:
         try: await page.close()
         except Exception: pass
 
-    # Fetch exact metadata via GraphQL for each discovered shortcode
-    for code, alt, src in found_urls[:limit]:
+    items_scraped = []
+    for idx, (code, alt, src) in enumerate(found_reels[:limit]):
         rec = fetch_ig_metadata_graphql(code, tag)
         if rec:
             items_scraped.append(rec)
         else:
-            # Fallback if GraphQL query is rate limited
             title = alt[:100] if alt else f"#{tag} reel"
             items_scraped.append({
                 "platform": "Instagram", "content_type": "Reel",
@@ -273,20 +282,29 @@ async def scrape_ig(ctx, tag, limit=15):
                 "category": classify_category(f"{title} {alt} {tag}"),
                 "scraped_at": datetime.now().isoformat()
             })
+        if cb and idx % 10 == 0:
+            cb(len(found_reels), f"IG #{tag}: Extracted metadata {idx+1}/{len(found_reels)}")
+        time.sleep(0.15)
 
     return items_scraped
 
-# ── YOUTUBE PLAYWRIGHT SCRAPER ────────────────────────────────────────────────
-async def scrape_yt(ctx, tag, limit=25):
+# ── DEEP INFINITE SCROLL SCRAPER (YOUTUBE) ────────────────────────────────────
+async def scrape_yt_deep(ctx, tag, limit=100, cb=None):
     rows = []
     page = await ctx.new_page()
+    seen_ids = set()
+    
     try:
-        await page.goto(f"https://www.youtube.com/results?search_query=%23{tag}", wait_until="domcontentloaded", timeout=25000)
+        await page.goto(f"https://www.youtube.com/results?search_query=%23{tag}", wait_until="domcontentloaded", timeout=30000)
         await asyncio.sleep(3)
-        for _ in range(6):
-            await page.evaluate("window.scrollBy(0, 3000)")
-            await asyncio.sleep(1)
+        
+        max_scrolls = max(20, limit // 4)
+        for scroll_idx in range(max_scrolls):
+            await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+            await asyncio.sleep(1.2)
+            
             vids = await page.query_selector_all("ytd-video-renderer,ytd-rich-item-renderer")
+            if cb: cb(len(seen_ids), f"YT #{tag}: Discovered {len(vids)} elements...")
             if len(vids) >= limit: break
 
         vids = await page.query_selector_all("ytd-video-renderer,ytd-rich-item-renderer")
@@ -296,6 +314,12 @@ async def scrape_yt(ctx, tag, limit=25):
             title = (await t_el.inner_text()).strip()
             if not title: continue
             
+            href = await t_el.get_attribute("href") or ""
+            vid_m = re.search(r"(?:v=|/shorts/)([A-Za-z0-9_-]{11})", href)
+            vid_id = vid_m.group(1) if vid_m else ""
+            if vid_id in seen_ids: continue
+            seen_ids.add(vid_id)
+
             views = None
             spans = await v.query_selector_all("#metadata-line span")
             for span in spans:
@@ -314,20 +338,14 @@ async def scrape_yt(ctx, tag, limit=25):
                 st_text = (await span.inner_text()).strip()
                 m2 = re.search(r"(\d+)\s*(second|minute|hour|day|week|month|year)s?\s*ago", st_text, re.I)
                 if m2:
-                    n2 = int(m2.group(1))
-                    unit = m2.group(2).lower()
+                    n2 = int(m2.group(1)); unit = m2.group(2).lower()
                     delta_map = {"second": 1, "minute": 60, "hour": 3600, "day": 86400, "week": 604800, "month": 2592000, "year": 31536000}
-                    secs = n2 * delta_map.get(unit, 86400)
-                    posted_on = (datetime.now() - timedelta(seconds=secs)).isoformat()
+                    posted_on = (datetime.now() - timedelta(seconds=n2 * delta_map.get(unit, 86400))).isoformat()
                     break
 
             ch = await v.query_selector("#channel-name a,ytd-channel-name a")
             channel = (await ch.inner_text()).strip() if ch else ""
-            href = await t_el.get_attribute("href") or ""
             is_s = "/shorts/" in href
-            
-            vid_m = re.search(r"(?:v=|/shorts/)([A-Za-z0-9_-]{11})", href)
-            vid_id = vid_m.group(1) if vid_m else ""
             thumb = f"https://img.youtube.com/vi/{vid_id}/mqdefault.jpg" if vid_id else ""
 
             rows.append({
@@ -353,23 +371,23 @@ async def scrape_yt(ctx, tag, limit=25):
         except Exception: pass
     return rows
 
-# ── SCRAPE RUNNER ─────────────────────────────────────────────────────────────
+# ── SCRAPE PIPELINE THREADING ──────────────────────────────────────────────────
 async def _run_all(hashtags, platforms, per_tag, progress_cb):
     from playwright.async_api import async_playwright
     all_records = []
-    BATCH = 3
+    BATCH = 2
     async with async_playwright() as pw:
         total = len(hashtags); done = 0
         for i in range(0, total, BATCH):
             batch = hashtags[i:i+BATCH]
-            results = await asyncio.gather(*[_scrape_one(pw, t, platforms, per_tag) for t in batch], return_exceptions=True)
+            results = await asyncio.gather(*[_scrape_one(pw, t, platforms, per_tag, progress_cb) for t in batch], return_exceptions=True)
             for r in results:
                 if isinstance(r, list): all_records.extend(r)
             done += len(batch)
-            if progress_cb: progress_cb(done/total, f"{done}/{total} hashtags")
+            if progress_cb: progress_cb(done/total, f"Batch complete: {done}/{total} hashtags")
     return all_records
 
-async def _scrape_one(pw, tag, platforms, per_tag):
+async def _scrape_one(pw, tag, platforms, per_tag, progress_cb):
     rows = []
     args = ["--disable-blink-features=AutomationControlled", "--no-sandbox", "--disable-gpu",
             "--ignore-certificate-errors", "--disable-dev-shm-usage", "--disable-setuid-sandbox", "--no-zygote", "--mute-audio"]
@@ -382,7 +400,6 @@ async def _scrape_one(pw, tag, platforms, per_tag):
         viewport={"width": 1280, "height": 800},
         user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0 Safari/537.36",
         extra_http_headers={"Accept-Language": "en-IN,en;q=0.9"})
-    await ctx.add_init_script("Object.defineProperty(navigator,'webdriver',{get:()=>undefined});")
     
     cks = []
     if IG_SESSIONID: cks.append({"name": "sessionid", "value": IG_SESSIONID, "domain": ".instagram.com", "path": "/", "httpOnly": True, "secure": True, "sameSite": "Lax"})
@@ -391,10 +408,10 @@ async def _scrape_one(pw, tag, platforms, per_tag):
     
     try:
         if "Instagram" in platforms:
-            try: rows.extend(await scrape_ig(ctx, tag, per_tag))
+            try: rows.extend(await scrape_ig_deep(ctx, tag, per_tag, progress_cb))
             except Exception: pass
         if "YouTube" in platforms:
-            try: rows.extend(await scrape_yt(ctx, tag, per_tag))
+            try: rows.extend(await scrape_yt_deep(ctx, tag, per_tag, progress_cb))
             except Exception: pass
     finally:
         try: await ctx.close(); await browser.close()
@@ -420,16 +437,21 @@ def run_sync(hashtags, platforms, per_tag, cb=None):
     if exc: raise exc[0]
     return result.get("r", [])
 
-# ── SESSION STATE ─────────────────────────────────────────────────────────────
-BASE_TAGS = ["justdropped", "newarrivals", "productlaunch", "newproduct", "comingsoon",
-             "trendingnow", "whatshot", "tiktokmademebuyit", "instamademebuyit",
-             "musthave", "viralproduct", "obsessed", "shopnow", "shopthelook",
-             "kurtidesign", "meeshofinds", "trendingproducts"]
+# ── SESSION STATE INITIALIZATION ──────────────────────────────────────────────
+BASE_TAGS = ["trendingproducts", "justdropped", "newarrivals", "productlaunch", "newproduct",
+             "tiktokmademebuyit", "instamademebuyit", "musthave", "viralproduct", "shopthelook",
+             "kurtidesign", "meeshofinds", "ethnicwear"]
 
-if "sel_tags" not in st.session_state: st.session_state.sel_tags = BASE_TAGS[:5]
-if "sel_plats" not in st.session_state: st.session_state.sel_plats = ["Instagram", "YouTube"]
-if "per_tag" not in st.session_state: st.session_state.per_tag = 10
-if "sort_mode" not in st.session_state: st.session_state.sort_mode = "Engagement ↓"
+if "all_tags" not in st.session_state: 
+    st.session_state.all_tags = list(BASE_TAGS)
+if "sel_tags" not in st.session_state: 
+    st.session_state.sel_tags = BASE_TAGS[:2]
+if "sel_plats" not in st.session_state: 
+    st.session_state.sel_plats = ["Instagram", "YouTube"]
+if "per_tag" not in st.session_state: 
+    st.session_state.per_tag = 50
+if "sort_mode" not in st.session_state: 
+    st.session_state.sort_mode = "Engagement ↓"
 
 # ── STYLES ────────────────────────────────────────────────────────────────────
 st.markdown("""
@@ -451,28 +473,42 @@ st.markdown("""
 .ca{display:inline-block;padding:2px 8px;border-radius:11px;font-size:9.5px;background:#f0f4ff;color:#4361ee;margin-top:4px;}
 </style>""", unsafe_allow_html=True)
 
-st.markdown('<div class="hero"><div class="hero-t">📱 Social Trend Tracker</div>'
-            '<div class="hero-s">Playwright Hashtag Discovery + Direct GraphQL Metadata Extraction</div></div>',
+st.markdown('<div class="hero"><div class="hero-t">📱 Social Trend Tracker Pro</div>'
+            '<div class="hero-s">Deep Feed Extraction (Up to 1000 Reels) • Multi-Tag Support • Session Concurrency</div></div>',
             unsafe_allow_html=True)
 
 # ── SIDEBAR ───────────────────────────────────────────────────────────────────
 with st.sidebar:
-    st.title("⚙️ Settings")
-    new_t = st.multiselect("Hashtags", BASE_TAGS, default=st.session_state.sel_tags)
-    if new_t != st.session_state.sel_tags: st.session_state.sel_tags = new_t
+    st.title("⚙️ Controls")
     
-    custom = st.text_input("+ Custom tag", placeholder="kurtilovers")
-    if custom:
-        tag = custom.lower().strip("#").replace(" ", "")
-        if tag and tag not in st.session_state.sel_tags:
-            if tag not in BASE_TAGS: BASE_TAGS.append(tag)
-            st.session_state.sel_tags = st.session_state.sel_tags + [tag]
+    # Comma-Separated Custom Tags Processing
+    custom_input = st.text_input("+ Custom Tags (comma-separated)", placeholder="kurtilovers, kurti, ethnicwear")
+    if custom_input:
+        parsed_tags = [
+            t.strip().lower().lstrip("#").replace(" ", "") 
+            for t in custom_input.split(",") 
+            if t.strip()
+        ]
+        added_new = False
+        for tag in parsed_tags:
+            if tag:
+                if tag not in st.session_state.all_tags:
+                    st.session_state.all_tags.append(tag)
+                if tag not in st.session_state.sel_tags:
+                    st.session_state.sel_tags.append(tag)
+                    added_new = True
+        if added_new:
             st.rerun()
+
+    # Multiselect for Hashtags synchronized with st.session_state.all_tags
+    new_t = st.multiselect("Hashtags", options=st.session_state.all_tags, default=st.session_state.sel_tags)
+    if new_t != st.session_state.sel_tags: 
+        st.session_state.sel_tags = new_t
             
     new_p = st.multiselect("Platforms", ["Instagram", "YouTube"], default=st.session_state.sel_plats)
     if new_p != st.session_state.sel_plats: st.session_state.sel_plats = new_p
     
-    new_n = st.slider("Posts per hashtag per platform", 5, 50, st.session_state.per_tag)
+    new_n = st.slider("Posts per hashtag per platform", 10, 1000, st.session_state.per_tag, step=10)
     if new_n != st.session_state.per_tag: st.session_state.per_tag = new_n
     
     st.divider()
@@ -481,13 +517,13 @@ with st.sidebar:
     if new_sort != st.session_state.sort_mode: st.session_state.sort_mode = new_sort
     
     st.divider()
-    scrape_btn = st.button("🚀 Scrape Now", type="primary", use_container_width=True)
+    scrape_btn = st.button("🚀 Scrape Deep Feed", type="primary", use_container_width=True)
     
     st.divider()
-    all_db = load_data()
-    st.metric("Stored Records", len(all_db))
-    if st.button("🗑 Clear Stored Data", use_container_width=True):
-        save_data([])
+    user_data = get_user_records()
+    st.metric("Session Stored Records", len(user_data))
+    if st.button("🗑 Clear Session Data", use_container_width=True):
+        st.session_state.user_records = []
         st.rerun()
 
 sel_tags = st.session_state.sel_tags
@@ -496,24 +532,24 @@ per_n = st.session_state.per_tag
 
 # ── EXECUTE SCRAPE ────────────────────────────────────────────────────────────
 if scrape_btn and sel_tags:
-    prog = st.progress(0, "Starting...")
+    prog = st.progress(0, "Starting Deep Feed Extraction...")
     status = st.empty()
     def cb(f, m):
-        try: prog.progress(min(f, 0.99), m); status.info(m)
+        try: prog.progress(min(max(float(f), 0.0), 0.99), str(m)); status.info(str(m))
         except Exception: pass
     try:
         new_recs = run_sync(sel_tags, sel_plats, per_n, cb)
-        save_data(load_data() + new_recs)
+        save_user_records(new_recs)
         prog.empty(); status.empty()
-        st.success(f"✅ Scraped {len(new_recs)} posts.")
+        st.success(f"✅ Deep Scrape Completed! Retrieved {len(new_recs)} posts across selected hashtags.")
         st.rerun()
     except Exception as e:
         st.error(str(e))
 
 # ── FILTER & SORT DATA ────────────────────────────────────────────────────────
-all_data = load_data()
+all_data = get_user_records()
 if not all_data:
-    st.info("No data stored. Select hashtags and click 'Scrape Now'.")
+    st.info("No session data stored. Select hashtags and click 'Scrape Deep Feed'.")
     st.stop()
 
 df = pd.DataFrame(all_data)
@@ -551,10 +587,10 @@ def fv(v):
     if v >= 1_000: return f"{v/1_000:.0f}K"
     return str(v)
 
-def render_grid(data, label, max_n=60):
+def render_grid(data, label, max_n=1000):
     if data.empty: st.info("No posts for this view."); return
     d = apply_sort(data).head(max_n).reset_index(drop=True)
-    st.caption(f"Showing **{len(d)}** posts.")
+    st.caption(f"Displaying **{len(d)}** posts.")
     
     for i in range(0, len(d), 4):
         cols = st.columns(4)
