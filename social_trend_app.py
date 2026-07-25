@@ -1,13 +1,11 @@
 """
 social_trend_app.py
 Unified Social Trend Tracker Pro:
+- Dual-Pass YouTube Scraper: Physically clicks "Shorts" and "Videos" tabs to guarantee strict quota yields.
 - Safe Cookie Injection (Bypasses Playwright __Secure- strict validation crashes).
-- On-Screen Error Logging for background thread crashes.
 - Authenticated YouTube Scraping: Uses YT_COOKIE to bypass bot/consent walls.
 - Fixed HTML Escaping (UI cards no longer break on special characters).
 - Strictly Independent Quotas for Reels, Shorts, and Videos.
-- Fixed Time Window Filtering (L30d, L7d, L24h, Lifetime) with relative date parsing.
-- Internal Sorting: Sort by Platform (Grouped), Engagement, Recency, Views, or Likes.
 - Fresh Scrape / Replace Mode for exact matching.
 """
 import streamlit as st
@@ -317,135 +315,135 @@ def scrape_ig_deep_sync(ctx, tag, limit=50, status_container=None):
 
     return items_scraped
 
-# ── DEEP INFINITE SCROLL SCRAPER (YOUTUBE: INDEPENDENT SHORTS & VIDEOS) ────────
+# ── DEEP INFINITE SCROLL SCRAPER (YOUTUBE: ISOLATED DUAL-PASS) ─────────────────
 def scrape_yt_deep_sync(ctx, tag, limit=50, status_container=None, fetch_shorts=True, fetch_videos=True):
-    shorts_rows = []
-    videos_rows = []
-    page = ctx.new_page()
-    seen_ids = set()
     clean_tag = tag.lower().strip("#")
-    
-    try:
-        page.goto(f"https://www.youtube.com/hashtag/{clean_tag}", wait_until="domcontentloaded", timeout=30000)
-        time.sleep(3)
-        
-        # Check if YouTube is showing a consent/bot wall despite cookies
-        if "consent" in page.url or page.locator("form[action*='consent']").count() > 0:
-            if status_container:
-                status_container.warning(f"⚠️ YT #{clean_tag}: YouTube showed a consent wall. Ensure YT_COOKIE is valid.")
-            
-        max_scrolls = max(20, limit // 2)
-        no_new_count = 0
-        
-        for scroll_idx in range(max_scrolls):
-            page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-            time.sleep(1.5)
-            
-            # Target standard videos + shorts shelves
-            vids = page.query_selector_all("ytd-rich-item-renderer, ytd-video-renderer, ytd-reel-item-renderer")
-            initial_count = len(seen_ids)
-            
-            for v in vids:
-                a = v.query_selector("a[href*='/shorts/'], a[href*='/watch']")
-                if not a: continue
+    all_rows = []
 
-                href = a.get_attribute("href") or ""
-                is_short = "/shorts/" in href
+    def perform_yt_pass(target_type):
+        rows = []
+        seen_ids = set()
+        page = ctx.new_page()
+        try:
+            page.goto(f"https://www.youtube.com/hashtag/{clean_tag}", wait_until="domcontentloaded", timeout=30000)
+            time.sleep(2.5)
+            
+            # Physically click the dedicated Shorts or Videos Chip/Tab
+            try:
+                chip = page.locator("yt-chip-cloud-chip-renderer").get_by_text(target_type, exact=True).first
+                if chip.count() > 0:
+                    chip.click()
+                    time.sleep(2)
+            except Exception:
+                pass
+
+            max_scrolls = max(20, limit // 2)
+            no_new_count = 0
+            
+            for scroll_idx in range(max_scrolls):
+                page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                time.sleep(1.5)
                 
-                if is_short:
-                    if not fetch_shorts or len(shorts_rows) >= limit: continue
-                else:
-                    if not fetch_videos or len(videos_rows) >= limit: continue
-
-                vid_m = re.search(r"(?:v=|/shorts/)([A-Za-z0-9_-]{11})", href)
-                vid_id = vid_m.group(1) if vid_m else ""
-                if not vid_id or vid_id in seen_ids: continue
-
-                # Safe Title Extraction
-                title = ""
-                t_el = v.query_selector("#video-title, span#video-title, span.yt-core-attributed-string")
-                if t_el: title = t_el.inner_text().strip()
-                if not title:
-                    title = a.get_attribute("title") or a.get_attribute("aria-label") or f"#{clean_tag} {'Short' if is_short else 'Video'}"
-
-                seen_ids.add(vid_id)
-
-                views = None
-                raw_posted_str = ""
-                spans = v.query_selector_all("#metadata-line span, span.inline-metadata-item, #metadata span")
-                for span in spans:
-                    st_text = span.inner_text().strip()
-                    vm = re.search(r"([\d,\.]+(?:[\s\u00a0]+(?:crore|lakh))?[KMB]?)\s*views?", st_text, re.I)
-                    if vm and not views:
-                        views = parse_num(vm.group(1).strip())
-                    if "ago" in st_text.lower():
-                        raw_posted_str = st_text
-
-                if not views:
-                    aria = a.get_attribute("aria-label") or ""
-                    vm2 = re.search(r"([\d,\.]+(?:[\s\u00a0]+(?:crore|lakh))?[KMB]?)\s*views?", aria, re.I)
-                    if vm2: views = parse_num(vm2.group(1).strip())
-                    if not raw_posted_str:
-                        m_aria_ago = re.search(r"\d+\s*(?:second|minute|hour|day|week|month|year)s?\s*ago", aria, re.I)
-                        if m_aria_ago: raw_posted_str = m_aria_ago.group(0)
-
-                posted_on = parse_relative_date(raw_posted_str)
-
-                ch = v.query_selector("#channel-name a, ytd-channel-name a")
-                channel = ch.inner_text().strip() if ch else ""
-                thumb = f"https://img.youtube.com/vi/{vid_id}/mqdefault.jpg"
+                vids = page.query_selector_all("ytd-rich-item-renderer, ytd-video-renderer, ytd-reel-item-renderer")
+                initial_count = len(seen_ids)
                 
-                # Dynamic Platform Assignment
-                platform_name = "YouTube Shorts" if is_short else "YouTube Videos"
-                video_url = f"https://www.youtube.com{'/shorts/' + vid_id if is_short else '/watch?v=' + vid_id}"
+                for v in vids:
+                    a = v.query_selector("a[href*='/shorts/'], a[href*='/watch']")
+                    if not a: continue
 
-                item_rec = {
-                    "platform": platform_name,
-                    "content_type": "Shorts" if is_short else "Video",
-                    "hashtag": f"#{clean_tag}",
-                    "title": title.replace('\n', ' ').strip()[:150],
-                    "description": "",
-                    "url": video_url,
-                    "views": views,
-                    "likes": None,
-                    "comments": None,
-                    "engagement": views or 0,
-                    "creator": channel,
-                    "thumbnail": thumb,
-                    "posted_on": posted_on,
-                    "category": classify_category(f"{title} {clean_tag}"),
-                    "scraped_at": datetime.now().isoformat()
-                }
+                    href = a.get_attribute("href") or ""
+                    is_short = "/shorts/" in href
+                    
+                    # Strict Type Enforcement based on Pass
+                    if target_type == "Shorts" and not is_short: continue
+                    if target_type == "Videos" and is_short: continue
 
-                if is_short:
-                    shorts_rows.append(item_rec)
+                    vid_m = re.search(r"(?:v=|/shorts/)([A-Za-z0-9_-]{11})", href)
+                    vid_id = vid_m.group(1) if vid_m else ""
+                    if not vid_id or vid_id in seen_ids: continue
+
+                    # Safe Title Extraction
+                    title = ""
+                    t_el = v.query_selector("#video-title, span.yt-core-attributed-string")
+                    if t_el: title = t_el.inner_text().strip()
+                    if not title:
+                        title = a.get_attribute("title") or a.get_attribute("aria-label") or f"#{clean_tag} {target_type[:-1]}"
+
+                    seen_ids.add(vid_id)
+
+                    views = None
+                    raw_posted_str = ""
+                    spans = v.query_selector_all("#metadata-line span, span.inline-metadata-item, #metadata span")
+                    for span in spans:
+                        st_text = span.inner_text().strip()
+                        vm = re.search(r"([\d,\.]+(?:[\s\u00a0]+(?:crore|lakh))?[KMB]?)\s*views?", st_text, re.I)
+                        if vm and not views:
+                            views = parse_num(vm.group(1).strip())
+                        if "ago" in st_text.lower():
+                            raw_posted_str = st_text
+
+                    if not views:
+                        aria = a.get_attribute("aria-label") or ""
+                        vm2 = re.search(r"([\d,\.]+(?:[\s\u00a0]+(?:crore|lakh))?[KMB]?)\s*views?", aria, re.I)
+                        if vm2: views = parse_num(vm2.group(1).strip())
+                        if not raw_posted_str:
+                            m_aria_ago = re.search(r"\d+\s*(?:second|minute|hour|day|week|month|year)s?\s*ago", aria, re.I)
+                            if m_aria_ago: raw_posted_str = m_aria_ago.group(0)
+
+                    posted_on = parse_relative_date(raw_posted_str)
+
+                    ch = v.query_selector("#channel-name a, ytd-channel-name a, .ytd-channel-name a")
+                    channel = ch.inner_text().strip() if ch else ""
+                    thumb = f"https://img.youtube.com/vi/{vid_id}/mqdefault.jpg"
+                    
+                    platform_name = f"YouTube {target_type}"
+                    video_url = f"https://www.youtube.com{'/shorts/' + vid_id if is_short else '/watch?v=' + vid_id}"
+
+                    rows.append({
+                        "platform": platform_name,
+                        "content_type": "Shorts" if is_short else "Video",
+                        "hashtag": f"#{clean_tag}",
+                        "title": title.replace('\n', ' ').strip()[:150],
+                        "description": "",
+                        "url": video_url,
+                        "views": views,
+                        "likes": None,
+                        "comments": None,
+                        "engagement": views or 0,
+                        "creator": channel,
+                        "thumbnail": thumb,
+                        "posted_on": posted_on,
+                        "category": classify_category(f"{title} {clean_tag}"),
+                        "scraped_at": datetime.now().isoformat()
+                    })
+
+                    if len(rows) >= limit: break
+
+                if status_container:
+                    status_container.info(f"▶️ YT #{clean_tag}: Discovered {target_type}: {len(rows)}/{limit}")
+
+                if len(rows) >= limit: break
+                
+                if len(seen_ids) == initial_count:
+                    no_new_count += 1
+                    if no_new_count >= 3: break
                 else:
-                    videos_rows.append(item_rec)
+                    no_new_count = 0
 
-            if status_container:
-                msg_parts = []
-                if fetch_shorts: msg_parts.append(f"Shorts: {len(shorts_rows)}/{limit}")
-                if fetch_videos: msg_parts.append(f"Videos: {len(videos_rows)}/{limit}")
-                status_container.info(f"▶️ YT #{clean_tag}: Discovered " + " | ".join(msg_parts))
+        except Exception as e:
+            print(f"YT Exception ({target_type}): {e}")
+        finally:
+            try: page.close()
+            except Exception: pass
+        
+        return rows
 
-            shorts_fulfilled = (not fetch_shorts) or (len(shorts_rows) >= limit)
-            videos_fulfilled = (not fetch_videos) or (len(videos_rows) >= limit)
-            if shorts_fulfilled and videos_fulfilled:
-                break
-            
-            if len(seen_ids) == initial_count:
-                no_new_count += 1
-                if no_new_count >= 3: break
-            else:
-                no_new_count = 0
-
-    except Exception as e:
-        if status_container: status_container.error(f"YT Playwright Error: {e}")
-    finally:
-        try: page.close()
-        except Exception: pass
-
-    return shorts_rows + videos_rows
+    if fetch_shorts:
+        all_rows.extend(perform_yt_pass("Shorts"))
+    if fetch_videos:
+        all_rows.extend(perform_yt_pass("Videos"))
+        
+    return all_rows
 
 # ── SYNCHRONOUS SCRAPE EXECUTION ──────────────────────────────────────────────
 def execute_sync_scrape(hashtags, platforms, per_tag, status_box, progress_bar):
@@ -471,8 +469,6 @@ def execute_sync_scrape(hashtags, platforms, per_tag, status_box, progress_bar):
         )
 
         cks = []
-        
-        # Safely map URL domains to avoid strict Playwright Security crashes
         if IG_SESSIONID: cks.append({"name": "sessionid", "value": IG_SESSIONID, "url": "https://www.instagram.com"})
         if IG_CSRFTOKEN: cks.append({"name": "csrftoken", "value": IG_CSRFTOKEN, "url": "https://www.instagram.com"})
         
@@ -647,9 +643,9 @@ if scrape_btn and sel_tags:
         
         if new_recs:
             save_user_records(new_recs, replace=st.session_state.fresh_refresh)
-            status_box.success(f"✅ Scrape Completed! Extracted {len(new_recs)} exact matching records.")
+            status_box.success(f"✅ Scrape Completed! Extracted {len(new_recs)} records.")
         else:
-            status_box.warning("⚠️ Scrape finished, but 0 records were retrieved. Ensure your IG/YT cookies are active.")
+            status_box.warning("⚠️ Scrape finished, but 0 records were retrieved. Check your tags or update cookies.")
         
         time.sleep(2)
         st.rerun()
@@ -700,7 +696,7 @@ with qc3:
     st.download_button("⬇️ Export Data CSV", csv_b.getvalue(), "trends.csv", "text/csv", use_container_width=True)
 
 if dff.empty: 
-    st.info("No stored posts match the selected active tags. Click 'Scrape Deep Feed' to pull records for these tags.")
+    st.info("No stored posts match the selected active tags. Click 'Scrape Deep Feed' to pull records.")
     st.stop()
 
 def apply_sort(data_df):
