@@ -1,6 +1,7 @@
 """
 social_trend_app.py
 Unified Social Trend Tracker Pro:
+- Fixed Invalid Comparison Error: Aligned 'now' variable to UTC timezone to match the dataframe.
 - Fixed Timezone Error: Added utc=True to pandas to_datetime to prevent mixed timezone crashes.
 - YouTube Background Metadata Engine: Fetches exact Creator, Date, Views, and Likes directly from the video source code.
 - PERFECTED YT ENDPOINTS: Uses /hashtag/tag/shorts and /hashtag/tag/videos natively.
@@ -10,7 +11,7 @@ Unified Social Trend Tracker Pro:
 """
 import streamlit as st
 import os, re, json, gc, time, io, subprocess, sys, html
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from urllib.parse import quote
 import requests
 import pandas as pd
@@ -184,7 +185,7 @@ def fetch_ig_metadata_graphql(shortcode: str, tag: str):
         comments = item.get("comment_count")
         
         taken_at = item.get("taken_at")
-        posted_on = datetime.fromtimestamp(taken_at).isoformat() if taken_at else datetime.now().isoformat()
+        posted_on = datetime.fromtimestamp(taken_at).isoformat() if taken_at else datetime.now(timezone.utc).isoformat()
 
         candidates = item.get("image_versions2", {}).get("candidates", [])
         thumb = item.get("display_uri") or (candidates[0].get("url") if candidates else "")
@@ -209,7 +210,7 @@ def fetch_ig_metadata_graphql(shortcode: str, tag: str):
             "comments": comments,
             "engagement": views or likes or 0,
             "category": cat,
-            "scraped_at": datetime.now().isoformat()
+            "scraped_at": datetime.now(timezone.utc).isoformat()
         }
     except Exception: return None
 
@@ -237,7 +238,7 @@ def fetch_yt_metadata_requests(vid_id, target_type, clean_tag, yt_cookies_dict):
 
         # 3. Exact Upload Date
         d_match = re.search(r'<meta itemprop="datePublished" content="([^"]+)">', html_text)
-        posted_on = d_match.group(1) if d_match else datetime.now().isoformat()
+        posted_on = d_match.group(1) if d_match else datetime.now(timezone.utc).isoformat()
 
         # 4. Precise Views
         v_match = re.search(r'<meta itemprop="interactionCount" content="(\d+)">', html_text)
@@ -275,7 +276,7 @@ def fetch_yt_metadata_requests(vid_id, target_type, clean_tag, yt_cookies_dict):
             "thumbnail": thumb,
             "posted_on": posted_on,
             "category": classify_category(f"{title} {clean_tag}"),
-            "scraped_at": datetime.now().isoformat()
+            "scraped_at": datetime.now(timezone.utc).isoformat()
         }
     except Exception:
         return None
@@ -352,10 +353,10 @@ def scrape_ig_deep_sync(ctx, tag, limit=50, status_container=None):
                 "platform": "Instagram Reels", "content_type": "Reel",
                 "hashtag": f"#{clean_tag}", "url": f"https://www.instagram.com/reel/{code}/",
                 "title": title.replace('\n', ' '), "description": alt.replace('\n', ' '),
-                "creator": "", "thumbnail": src, "posted_on": datetime.now().isoformat(),
+                "creator": "", "thumbnail": src, "posted_on": datetime.now(timezone.utc).isoformat(),
                 "views": None, "likes": None, "engagement": 0,
                 "category": classify_category(f"{title} {alt} {clean_tag}"),
-                "scraped_at": datetime.now().isoformat()
+                "scraped_at": datetime.now(timezone.utc).isoformat()
             })
         if status_container and idx % 5 == 0:
             status_container.info(f"📸 IG #{clean_tag}: Extracted metadata {idx+1}/{total_found}")
@@ -777,7 +778,8 @@ def render_grid(data, label, max_n=500):
                 st.link_button(f"Open Link ↗", r.get("url", "#"), use_container_width=True)
 
 # ── TIME WINDOW TABS ──────────────────────────────────────────────────────────
-now = datetime.now()
+# Use timezone-aware now to match the timezone-aware 'uploaded_at' column
+now = datetime.now(timezone.utc)
 ua = dff["uploaded_at"]
 
 d1  = dff[ua.notna() & (ua >= now - timedelta(days=1))]
