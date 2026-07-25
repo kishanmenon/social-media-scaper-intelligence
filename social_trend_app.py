@@ -1,6 +1,7 @@
 """
 social_trend_app.py
 Unified Social Trend Tracker Pro:
+- Fixed Timezone Error: Added utc=True to pandas to_datetime to prevent mixed timezone crashes.
 - YouTube Background Metadata Engine: Fetches exact Creator, Date, Views, and Likes directly from the video source code.
 - PERFECTED YT ENDPOINTS: Uses /hashtag/tag/shorts and /hashtag/tag/videos natively.
 - Deep Scroll Fix: Uses keyboard events to force YouTube's lazy-loader.
@@ -661,7 +662,8 @@ df = pd.DataFrame(all_data)
 df["engagement"] = pd.to_numeric(df.get("engagement", 0), errors="coerce").fillna(0)
 df["views"] = pd.to_numeric(df.get("views", None), errors="coerce")
 df["likes"] = pd.to_numeric(df.get("likes", None), errors="coerce")
-df["uploaded_at"] = pd.to_datetime(df.get("posted_on", ""), errors="coerce")
+# Added utc=True to correctly handle mixed timezones from YouTube & IG
+df["uploaded_at"] = pd.to_datetime(df.get("posted_on", ""), errors="coerce", utc=True)
 
 # Exact Tag Normalization
 active_tags_set = {f"#{t.lower().strip('#')}" for t in sel_tags}
