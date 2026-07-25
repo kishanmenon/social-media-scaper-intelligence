@@ -1,10 +1,10 @@
 """
 social_trend_app.py
 Unified Social Trend Tracker Pro:
-- PERFECTED YT ENDPOINTS: Uses /hashtag/tag/shorts and /hashtag/tag/videos natively!
+- YouTube Background Metadata Engine: Fetches exact Creator, Date, Views, and Likes directly from the video source code.
+- PERFECTED YT ENDPOINTS: Uses /hashtag/tag/shorts and /hashtag/tag/videos natively.
 - Deep Scroll Fix: Uses keyboard events to force YouTube's lazy-loader.
 - Fixed HTML tiles with no Markdown indentation bugs.
-- Authenticated YouTube Scraping: Uses YT_COOKIE to bypass bot/consent walls.
 - Strictly Independent Quotas for Reels, Shorts, and Videos.
 """
 import streamlit as st
@@ -114,25 +114,6 @@ def parse_num(s):
         return int(n * {"K":1000,"M":1_000_000,"B":1_000_000_000}.get(m.group(2),1))
     except Exception: return None
 
-def parse_relative_date(text: str) -> str:
-    if not text: return datetime.now().isoformat()
-    text_clean = str(text).lower().strip()
-    m = re.search(r"(\d+)\s*(second|minute|hour|day|week|month|year)s?\s*ago", text_clean, re.I)
-    if m:
-        val = int(m.group(1))
-        unit = m.group(2).lower()
-        seconds_map = {
-            "second": 1, "minute": 60, "hour": 3600,
-            "day": 86400, "week": 604800, "month": 2592000, "year": 31536000
-        }
-        secs = val * seconds_map.get(unit, 86400)
-        return (datetime.now() - timedelta(seconds=secs)).isoformat()
-    try:
-        dt = pd.to_datetime(text_clean, errors="coerce")
-        if pd.notna(dt): return dt.isoformat()
-    except Exception: pass
-    return datetime.now().isoformat()
-
 def fmt(domain, link):
     if not link: return ""
     link = link.strip()
@@ -156,7 +137,7 @@ def save_user_records(new_records, replace=False):
                 by_url[r["url"]] = r
         st.session_state.user_records = list(by_url.values())
 
-# ── INSTAGRAM GRAPHQL METADATA QUERY ─────────────────────────────────────────
+# ── INSTAGRAM METADATA (GRAPHQL) ─────────────────────────────────────────────
 def fetch_ig_metadata_graphql(shortcode: str, tag: str):
     clean_tag = tag.lower().strip("#")
     variables = json.dumps({"shortcode": shortcode})
@@ -182,7 +163,7 @@ def fetch_ig_metadata_graphql(shortcode: str, tag: str):
     headers = {
         "accept": "*/*",
         "content-type": "application/x-www-form-urlencoded",
-        "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36",
+        "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
         "x-csrftoken": csrf,
         "x-ig-app-id": "936619743392459",
         "Cookie": cookie_str,
@@ -230,6 +211,73 @@ def fetch_ig_metadata_graphql(shortcode: str, tag: str):
             "scraped_at": datetime.now().isoformat()
         }
     except Exception: return None
+
+# ── YOUTUBE METADATA (BACKGROUND REQUESTS ENGINE) ────────────────────────────
+def fetch_yt_metadata_requests(vid_id, target_type, clean_tag, yt_cookies_dict):
+    """Fetches comprehensive metadata securely directly from the YouTube Video HTML"""
+    url = f"https://www.youtube.com/watch?v={vid_id}"
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "Accept-Language": "en-US,en;q=0.9"
+    }
+    
+    try:
+        res = requests.get(url, headers=headers, cookies=yt_cookies_dict, timeout=8)
+        if res.status_code != 200: return None
+        html_text = res.text
+
+        # 1. Exact Title Extraction
+        t_match = re.search(r'<meta name="title" content="([^"]+)">', html_text)
+        title = html.unescape(t_match.group(1)) if t_match else f"#{clean_tag} {target_type[:-1]}"
+
+        # 2. Exact Creator Name
+        c_match = re.search(r'<link itemprop="name" content="([^"]+)">', html_text)
+        creator = html.unescape(c_match.group(1)) if c_match else ""
+
+        # 3. Exact Upload Date
+        d_match = re.search(r'<meta itemprop="datePublished" content="([^"]+)">', html_text)
+        posted_on = d_match.group(1) if d_match else datetime.now().isoformat()
+
+        # 4. Precise Views
+        v_match = re.search(r'<meta itemprop="interactionCount" content="(\d+)">', html_text)
+        if v_match:
+            views = int(v_match.group(1))
+        else:
+            v_match2 = re.search(r'"viewCount":"(\d+)"', html_text)
+            views = int(v_match2.group(1)) if v_match2 else 0
+
+        # 5. Precise Likes (Extracts from ytInitialData payload)
+        likes = 0
+        l_match = re.search(r'"likeCount":"(\d+)"', html_text)
+        if l_match:
+            likes = int(l_match.group(1))
+        else:
+            text_like = re.search(r'"accessibilityText":"([\d,KMB\.]+) likes"', html_text)
+            if text_like:
+                likes = parse_num(text_like.group(1).replace(',', ''))
+
+        thumb = f"https://img.youtube.com/vi/{vid_id}/mqdefault.jpg"
+        video_url = f"https://www.youtube.com{'/shorts/' + vid_id if target_type == 'Shorts' else '/watch?v=' + vid_id}"
+
+        return {
+            "platform": f"YouTube {target_type}",
+            "content_type": "Shorts" if target_type == "Shorts" else "Video",
+            "hashtag": f"#{clean_tag}",
+            "title": title.strip()[:150],
+            "description": "",
+            "url": video_url,
+            "views": views,
+            "likes": likes,
+            "comments": None,
+            "engagement": views or likes or 0,
+            "creator": creator,
+            "thumbnail": thumb,
+            "posted_on": posted_on,
+            "category": classify_category(f"{title} {clean_tag}"),
+            "scraped_at": datetime.now().isoformat()
+        }
+    except Exception:
+        return None
 
 # ── DEEP INFINITE SCROLL SCRAPER (INSTAGRAM REELS) ────────────────────────────
 def scrape_ig_deep_sync(ctx, tag, limit=50, status_container=None):
@@ -314,17 +362,16 @@ def scrape_ig_deep_sync(ctx, tag, limit=50, status_container=None):
 
     return items_scraped
 
-# ── DEEP INFINITE SCROLL SCRAPER (YOUTUBE NATIVE ENDPOINTS) ───────────────────
-def scrape_yt_deep_sync(ctx, tag, limit=50, status_container=None, fetch_shorts=True, fetch_videos=True):
+# ── DEEP INFINITE SCROLL SCRAPER (YOUTUBE ALIGNED METADATA PASS) ──────────────
+def scrape_yt_deep_sync(ctx, tag, limit, status_container, fetch_shorts, fetch_videos, yt_cookies_dict):
     clean_tag = tag.lower().strip("#")
     all_rows = []
 
     def perform_yt_url_pass(target_type):
-        rows = []
-        seen_ids = set()
+        collected_ids = []
         page = ctx.new_page()
         try:
-            # PERFECTED Native YouTube Hashtag Feeds using the direct /shorts and /videos paths
+            # Step 1: Deep Scroll Feed to gather pure IDs
             if target_type == "Shorts":
                 target_url = f"https://www.youtube.com/hashtag/{clean_tag}/shorts"
             else:
@@ -333,24 +380,19 @@ def scrape_yt_deep_sync(ctx, tag, limit=50, status_container=None, fetch_shorts=
             page.goto(target_url, wait_until="domcontentloaded", timeout=30000)
             time.sleep(3.0)
 
-            # High patience variables to force YouTube's lazy-loader
             max_scrolls = max(40, limit)
             no_new_count = 0
             
             for scroll_idx in range(max_scrolls):
-                # Trigger network fetches using keyboard and deep JS scrolling
                 page.keyboard.press("End")
                 time.sleep(0.5)
                 page.evaluate("window.scrollBy(0, 10000)")
-                time.sleep(2.5)  # Extended wait to allow slow lazy-loading
+                time.sleep(2.5) 
                 
-                vids = page.query_selector_all("ytd-rich-item-renderer, ytd-video-renderer, ytd-reel-item-renderer")
-                initial_count = len(seen_ids)
+                vids = page.query_selector_all("a[href*='/shorts/'], a[href*='/watch']")
+                initial_count = len(collected_ids)
                 
-                for v in vids:
-                    a = v.query_selector("a[href*='/shorts/'], a[href*='/watch']")
-                    if not a: continue
-
+                for a in vids:
                     href = a.get_attribute("href") or ""
                     is_short = "/shorts/" in href
                     
@@ -359,72 +401,17 @@ def scrape_yt_deep_sync(ctx, tag, limit=50, status_container=None, fetch_shorts=
 
                     vid_m = re.search(r"(?:v=|/shorts/)([A-Za-z0-9_-]{11})", href)
                     vid_id = vid_m.group(1) if vid_m else ""
-                    if not vid_id or vid_id in seen_ids: continue
+                    if vid_id and vid_id not in collected_ids:
+                        collected_ids.append(vid_id)
 
-                    # Safe Title Extraction
-                    title = ""
-                    t_el = v.query_selector("#video-title, span.yt-core-attributed-string")
-                    if t_el: title = t_el.inner_text().strip()
-                    if not title:
-                        title = a.get_attribute("title") or a.get_attribute("aria-label") or f"#{clean_tag} {target_type[:-1]}"
-
-                    seen_ids.add(vid_id)
-
-                    views = None
-                    raw_posted_str = ""
-                    spans = v.query_selector_all("#metadata-line span, span.inline-metadata-item, #metadata span")
-                    for span in spans:
-                        st_text = span.inner_text().strip()
-                        vm = re.search(r"([\d,\.]+(?:[\s\u00a0]+(?:crore|lakh))?[KMB]?)\s*views?", st_text, re.I)
-                        if vm and not views:
-                            views = parse_num(vm.group(1).strip())
-                        if "ago" in st_text.lower():
-                            raw_posted_str = st_text
-
-                    if not views:
-                        aria = a.get_attribute("aria-label") or ""
-                        vm2 = re.search(r"([\d,\.]+(?:[\s\u00a0]+(?:crore|lakh))?[KMB]?)\s*views?", aria, re.I)
-                        if vm2: views = parse_num(vm2.group(1).strip())
-                        if not raw_posted_str:
-                            m_aria_ago = re.search(r"\d+\s*(?:second|minute|hour|day|week|month|year)s?\s*ago", aria, re.I)
-                            if m_aria_ago: raw_posted_str = m_aria_ago.group(0)
-
-                    posted_on = parse_relative_date(raw_posted_str)
-
-                    ch = v.query_selector("#channel-name a, ytd-channel-name a, .ytd-channel-name a")
-                    channel = ch.inner_text().strip() if ch else ""
-                    thumb = f"https://img.youtube.com/vi/{vid_id}/mqdefault.jpg"
-                    
-                    platform_name = f"YouTube {target_type}"
-                    video_url = f"https://www.youtube.com{'/shorts/' + vid_id if is_short else '/watch?v=' + vid_id}"
-
-                    rows.append({
-                        "platform": platform_name,
-                        "content_type": "Shorts" if is_short else "Video",
-                        "hashtag": f"#{clean_tag}",
-                        "title": title.replace('\n', ' ').strip()[:150],
-                        "description": "",
-                        "url": video_url,
-                        "views": views,
-                        "likes": None,
-                        "comments": None,
-                        "engagement": views or 0,
-                        "creator": channel,
-                        "thumbnail": thumb,
-                        "posted_on": posted_on,
-                        "category": classify_category(f"{title} {clean_tag}"),
-                        "scraped_at": datetime.now().isoformat()
-                    })
-
-                    if len(rows) >= limit: break
+                    if len(collected_ids) >= limit: break
 
                 if status_container:
-                    status_container.info(f"▶️ YT #{clean_tag}: Discovered {target_type}: {len(rows)}/{limit}")
+                    status_container.info(f"▶️ YT #{clean_tag}: Discovered {target_type} IDs: {len(collected_ids)}/{limit}")
 
-                if len(rows) >= limit: break
+                if len(collected_ids) >= limit: break
                 
-                # Increased Patience Threshold (Wait 5 cycles / 12+ seconds before giving up)
-                if len(seen_ids) == initial_count:
+                if len(collected_ids) == initial_count:
                     no_new_count += 1
                     if no_new_count >= 5: break
                 else:
@@ -436,6 +423,17 @@ def scrape_yt_deep_sync(ctx, tag, limit=50, status_container=None, fetch_shorts=
             try: page.close()
             except Exception: pass
         
+        # Step 2: Loop collected IDs to fetch precise background metadata
+        rows = []
+        for idx, vid_id in enumerate(collected_ids):
+            if status_container and idx % 5 == 0:
+                status_container.info(f"▶️ YT #{clean_tag}: Fetching metadata for {target_type} {idx+1}/{len(collected_ids)}")
+            
+            meta = fetch_yt_metadata_requests(vid_id, target_type, clean_tag, yt_cookies_dict)
+            if meta:
+                rows.append(meta)
+            time.sleep(0.1) # Soft pause to prevent rate limiting
+            
         return rows
 
     if fetch_shorts:
@@ -464,7 +462,7 @@ def execute_sync_scrape(hashtags, platforms, per_tag, status_box, progress_bar):
 
         ctx = browser.new_context(
             viewport={"width": 1280, "height": 800},
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0 Safari/537.36",
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
             extra_http_headers={"Accept-Language": "en-IN,en;q=0.9"}
         )
 
@@ -472,15 +470,14 @@ def execute_sync_scrape(hashtags, platforms, per_tag, status_box, progress_bar):
         if IG_SESSIONID: cks.append({"name": "sessionid", "value": IG_SESSIONID, "url": "https://www.instagram.com"})
         if IG_CSRFTOKEN: cks.append({"name": "csrftoken", "value": IG_CSRFTOKEN, "url": "https://www.instagram.com"})
         
+        # Build dictionary for the requests.get() background metadata fetcher
+        yt_req_cookies = {}
         if YT_COOKIE:
             for c_item in YT_COOKIE.split(";"):
                 if "=" in c_item:
                     k, v = c_item.strip().split("=", 1)
-                    cks.append({
-                        "name": k,
-                        "value": v,
-                        "url": "https://www.youtube.com"
-                    })
+                    yt_req_cookies[k] = v
+                    cks.append({"name": k, "value": v, "url": "https://www.youtube.com"})
 
         if cks: 
             try:
@@ -506,7 +503,7 @@ def execute_sync_scrape(hashtags, platforms, per_tag, status_box, progress_bar):
 
             if fetch_shorts or fetch_videos:
                 try:
-                    yt_items = scrape_yt_deep_sync(ctx, clean_tag, per_tag, status_box, fetch_shorts, fetch_videos)
+                    yt_items = scrape_yt_deep_sync(ctx, clean_tag, per_tag, status_box, fetch_shorts, fetch_videos, yt_req_cookies)
                     all_results.extend(yt_items)
                 except Exception as e:
                     print(f"Error on YT #{clean_tag}: {e}")
@@ -567,7 +564,7 @@ st.markdown("""
 </style>""", unsafe_allow_html=True)
 
 st.markdown('<div class="hero"><div class="hero-t">📱 Social Trend Tracker Pro</div>'
-            '<div class="hero-s">Native Endpoint Access • Independent Quotas • Exact Matching</div></div>',
+            '<div class="hero-s">Native Endpoint Access • Independent Quotas • Exact Metadata Matching</div></div>',
             unsafe_allow_html=True)
 
 # ── SIDEBAR ───────────────────────────────────────────────────────────────────
