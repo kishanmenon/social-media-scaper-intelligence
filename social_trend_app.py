@@ -1,10 +1,11 @@
 """
 social_trend_app.py
-Crash-Proof Trend Tracker with Active Instagram Diagnostics:
-- Detects expired IG_SESSIONID / IG_CSRFTOKEN and alerts user.
-- Handles Instagram login redirects gracefully.
-- YouTube deep search & extraction.
-- Session concurrency and low-memory Chromium execution.
+Unified Social Trend Tracker Pro:
+- Internal Sorting: Sort by Platform (Grouped), Engagement, Recency, Views, or Likes.
+- Fresh Scrape / Replace Mode for a 100% complete refresh on each run.
+- Explicit Segregation: Instagram Reels, YouTube Shorts, and YouTube Videos.
+- Strict Exact Tag Matching: Eliminates partial tag leakage.
+- Low-memory Playwright execution for Streamlit Cloud stability.
 """
 import streamlit as st
 import os, re, json, gc, time, io, subprocess, sys
@@ -124,16 +125,20 @@ def get_user_records():
         st.session_state.user_records = []
     return st.session_state.user_records
 
-def save_user_records(new_records):
-    existing = get_user_records()
-    by_url = {r["url"]: r for r in existing if r.get("url")}
-    for r in new_records:
-        if r.get("url"):
-            by_url[r["url"]] = r
-    st.session_state.user_records = list(by_url.values())
+def save_user_records(new_records, replace=False):
+    if replace:
+        st.session_state.user_records = new_records
+    else:
+        existing = get_user_records()
+        by_url = {r["url"]: r for r in existing if r.get("url")}
+        for r in new_records:
+            if r.get("url"):
+                by_url[r["url"]] = r
+        st.session_state.user_records = list(by_url.values())
 
 # ── INSTAGRAM GRAPHQL METADATA QUERY ─────────────────────────────────────────
 def fetch_ig_metadata_graphql(shortcode: str, tag: str):
+    clean_tag = tag.lower().strip("#")
     variables = json.dumps({"shortcode": shortcode})
     encoded_variables = quote(variables)
 
@@ -184,14 +189,14 @@ def fetch_ig_metadata_graphql(shortcode: str, tag: str):
         owner = item.get("owner", {}) or item.get("user", {})
         creator = f"@{owner.get('username', '')}" if owner.get('username') else ""
 
-        title = caption[:100].replace('\n', ' ') if caption else f"#{tag} reel"
+        title = caption[:100].replace('\n', ' ') if caption else f"#{clean_tag} reel"
         desc = caption.replace('\n', ' ')
-        cat = classify_category(f"{title} {desc} {tag}")
+        cat = classify_category(f"{title} {desc} {clean_tag}")
 
         return {
-            "platform": "Instagram",
+            "platform": "Instagram Reels",
             "content_type": "Reel",
-            "hashtag": f"#{tag}",
+            "hashtag": f"#{clean_tag}",
             "url": f"https://www.instagram.com/reel/{shortcode}/",
             "title": title,
             "description": desc,
@@ -212,26 +217,19 @@ def scrape_ig_deep_sync(ctx, tag, limit=100, status_container=None):
     page = ctx.new_page()
     found_reels = []
     seen_codes = set()
+    clean_tag = tag.lower().strip("#")
     
     try:
-        page.goto(f"https://www.instagram.com/explore/tags/{tag}/", wait_until="domcontentloaded", timeout=25000)
+        page.goto(f"https://www.instagram.com/explore/tags/{clean_tag}/", wait_until="domcontentloaded", timeout=25000)
         time.sleep(2)
         
-        # Check for Instagram Login Redirect / Block
         if "login" in page.url or "accounts" in page.url:
             if status_container:
-                status_container.warning(f"⚠️ IG #{tag}: Instagram redirected to login wall. Ensure IG_SESSIONID in Secrets is active.")
+                status_container.warning(f"⚠️ IG #{clean_tag}: Redirected to login wall. Update IG_SESSIONID in Secrets.")
             return []
 
-        # Attempt to click 'Recent' tab if available
-        for recent_sel in ["span:text-is('Recent')", "div[role='tab']:has-text('Recent')", "a[href*='recent']"]:
-            try:
-                tab = page.locator(recent_sel).first
-                if tab.count():
-                    tab.click()
-                    time.sleep(1.5)
-                    break
-            except Exception: continue
+        main_el = page.locator("main")
+        grid_scope = main_el if main_el.count() else page
 
         max_scroll_attempts = max(10, limit // 3)
         no_new_items_count = 0
@@ -240,7 +238,7 @@ def scrape_ig_deep_sync(ctx, tag, limit=100, status_container=None):
             page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
             time.sleep(1.0)
 
-            links = page.locator("a[href*='/reel/'], a[href*='/p/']").all()
+            links = grid_scope.locator("a[href*='/reel/'], a[href*='/p/']").all()
             initial_count = len(seen_codes)
             
             for el in links:
@@ -259,7 +257,7 @@ def scrape_ig_deep_sync(ctx, tag, limit=100, status_container=None):
                         if len(found_reels) >= limit: break
             
             if status_container:
-                status_container.info(f"📸 IG #{tag}: Discovered {len(found_reels)}/{limit} links...")
+                status_container.info(f"📸 IG #{clean_tag}: Discovered {len(found_reels)}/{limit} links...")
             if len(found_reels) >= limit: break
             
             if len(seen_codes) == initial_count:
@@ -277,34 +275,35 @@ def scrape_ig_deep_sync(ctx, tag, limit=100, status_container=None):
     items_scraped = []
     total_found = len(found_reels[:limit])
     for idx, (code, alt, src) in enumerate(found_reels[:limit]):
-        rec = fetch_ig_metadata_graphql(code, tag)
+        rec = fetch_ig_metadata_graphql(code, clean_tag)
         if rec:
             items_scraped.append(rec)
         else:
-            title = alt[:100] if alt else f"#{tag} reel"
+            title = alt[:100] if alt else f"#{clean_tag} reel"
             items_scraped.append({
-                "platform": "Instagram", "content_type": "Reel",
-                "hashtag": f"#{tag}", "url": f"https://www.instagram.com/reel/{code}/",
+                "platform": "Instagram Reels", "content_type": "Reel",
+                "hashtag": f"#{clean_tag}", "url": f"https://www.instagram.com/reel/{code}/",
                 "title": title.replace('\n', ' '), "description": alt.replace('\n', ' '),
                 "creator": "", "thumbnail": src, "posted_on": datetime.now().isoformat(),
                 "views": None, "likes": None, "engagement": 0,
-                "category": classify_category(f"{title} {alt} {tag}"),
+                "category": classify_category(f"{title} {alt} {clean_tag}"),
                 "scraped_at": datetime.now().isoformat()
             })
         if status_container and idx % 5 == 0:
-            status_container.info(f"📸 IG #{tag}: Extracted metadata {idx+1}/{total_found}")
+            status_container.info(f"📸 IG #{clean_tag}: Extracted metadata {idx+1}/{total_found}")
         time.sleep(0.08)
 
     return items_scraped
 
-# ── DEEP INFINITE SCROLL SCRAPER (YOUTUBE) ────────────────────────────────────
-def scrape_yt_deep_sync(ctx, tag, limit=100, status_container=None):
+# ── DEEP INFINITE SCROLL SCRAPER (YOUTUBE: SHORTS vs VIDEOS) ───────────────────
+def scrape_yt_deep_sync(ctx, tag, limit=100, status_container=None, fetch_shorts=True, fetch_videos=True):
     rows = []
     page = ctx.new_page()
     seen_ids = set()
+    clean_tag = tag.lower().strip("#")
     
     try:
-        page.goto(f"https://www.youtube.com/results?search_query=%23{tag}", wait_until="domcontentloaded", timeout=25000)
+        page.goto(f"https://www.youtube.com/results?search_query=%23{clean_tag}", wait_until="domcontentloaded", timeout=25000)
         time.sleep(2)
         
         max_scrolls = max(10, limit // 4)
@@ -312,26 +311,36 @@ def scrape_yt_deep_sync(ctx, tag, limit=100, status_container=None):
             page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
             time.sleep(1.0)
             
-            vids = page.query_selector_all("ytd-video-renderer,ytd-rich-item-renderer")
+            vids = page.query_selector_all("ytd-video-renderer,ytd-rich-item-renderer,ytd-reel-item-renderer")
             if status_container:
-                status_container.info(f"▶️ YT #{tag}: Discovered {len(vids)} items...")
-            if len(vids) >= limit: break
+                status_container.info(f"▶️ YT #{clean_tag}: Discovered {len(vids)} items...")
+            if len(vids) >= limit * 2: break
 
-        vids = page.query_selector_all("ytd-video-renderer,ytd-rich-item-renderer")
-        for v in vids[:limit]:
-            t_el = v.query_selector("#video-title,a#video-title")
+        vids = page.query_selector_all("ytd-video-renderer,ytd-rich-item-renderer,ytd-reel-item-renderer")
+        for v in vids:
+            t_el = v.query_selector("#video-title,a#video-title,span#video-title")
             if not t_el: continue
             title = (t_el.inner_text()).strip()
             if not title: continue
             
             href = t_el.get_attribute("href") or ""
+            if not href:
+                parent_a = v.query_selector("a[href*='/shorts/'], a[href*='/watch']")
+                if parent_a: href = parent_a.get_attribute("href") or ""
+
+            is_short = "/shorts/" in href
+            
+            # Segregation Filter Check
+            if is_short and not fetch_shorts: continue
+            if not is_short and not fetch_videos: continue
+
             vid_m = re.search(r"(?:v=|/shorts/)([A-Za-z0-9_-]{11})", href)
             vid_id = vid_m.group(1) if vid_m else ""
-            if vid_id in seen_ids: continue
+            if not vid_id or vid_id in seen_ids: continue
             seen_ids.add(vid_id)
 
             views = None
-            spans = v.query_selector_all("#metadata-line span")
+            spans = v.query_selector_all("#metadata-line span, span.inline-metadata-item")
             for span in spans:
                 st_text = (span.inner_text()).strip()
                 vm = re.search(r"([\d,\.]+(?:[\s\u00a0]+(?:crore|lakh))?[KMB]?)\s*views?", st_text, re.I)
@@ -355,13 +364,14 @@ def scrape_yt_deep_sync(ctx, tag, limit=100, status_container=None):
 
             ch = v.query_selector("#channel-name a,ytd-channel-name a")
             channel = (ch.inner_text()).strip() if ch else ""
-            is_s = "/shorts/" in href
             thumb = f"https://img.youtube.com/vi/{vid_id}/mqdefault.jpg" if vid_id else ""
 
+            platform_name = "YouTube Shorts" if is_short else "YouTube Videos"
+
             rows.append({
-                "platform": "YouTube",
-                "content_type": "Shorts" if is_s else "Video",
-                "hashtag": f"#{tag}",
+                "platform": platform_name,
+                "content_type": "Shorts" if is_short else "Video",
+                "hashtag": f"#{clean_tag}",
                 "title": title.replace('\n', ' '),
                 "description": "",
                 "url": fmt("https://www.youtube.com", href),
@@ -372,9 +382,11 @@ def scrape_yt_deep_sync(ctx, tag, limit=100, status_container=None):
                 "creator": channel,
                 "thumbnail": thumb,
                 "posted_on": posted_on,
-                "category": classify_category(f"{title} {tag}"),
+                "category": classify_category(f"{title} {clean_tag}"),
                 "scraped_at": datetime.now().isoformat()
             })
+            if len(rows) >= limit: break
+
     except Exception as e:
         print(f"YT Exception: {e}")
     finally:
@@ -412,22 +424,26 @@ def execute_sync_scrape(hashtags, platforms, per_tag, status_box, progress_bar):
 
         total_tags = len(hashtags)
         for i, tag in enumerate(hashtags):
+            clean_tag = tag.lower().strip("#")
             if progress_bar:
-                progress_bar.progress(float(i / total_tags), f"Processing hashtag {i+1}/{total_tags}: #{tag}")
+                progress_bar.progress(float(i / total_tags), f"Processing hashtag {i+1}/{total_tags}: #{clean_tag}")
 
-            if "Instagram" in platforms:
+            if "Instagram Reels" in platforms:
                 try:
-                    ig_items = scrape_ig_deep_sync(ctx, tag, per_tag, status_box)
+                    ig_items = scrape_ig_deep_sync(ctx, clean_tag, per_tag, status_box)
                     all_results.extend(ig_items)
                 except Exception as e:
-                    print(f"Error on IG #{tag}: {e}")
+                    print(f"Error on IG #{clean_tag}: {e}")
 
-            if "YouTube" in platforms:
+            fetch_shorts = "YouTube Shorts" in platforms
+            fetch_videos = "YouTube Videos" in platforms
+
+            if fetch_shorts or fetch_videos:
                 try:
-                    yt_items = scrape_yt_deep_sync(ctx, tag, per_tag, status_box)
+                    yt_items = scrape_yt_deep_sync(ctx, clean_tag, per_tag, status_box, fetch_shorts, fetch_videos)
                     all_results.extend(yt_items)
                 except Exception as e:
-                    print(f"Error on YT #{tag}: {e}")
+                    print(f"Error on YT #{clean_tag}: {e}")
 
         try:
             ctx.close()
@@ -442,16 +458,26 @@ BASE_TAGS = ["trendingproducts", "justdropped", "newarrivals", "productlaunch", 
              "tiktokmademebuyit", "instamademebuyit", "musthave", "viralproduct", "shopthelook",
              "kurtidesign", "meeshofinds", "ethnicwear"]
 
+SORT_OPTIONS = [
+    "Engagement ↓",
+    "Most Recent ↓",
+    "Platform (Grouped)",
+    "Views ↓",
+    "Likes ↓"
+]
+
 if "all_tags" not in st.session_state: 
     st.session_state.all_tags = list(BASE_TAGS)
 if "sel_tags" not in st.session_state: 
     st.session_state.sel_tags = BASE_TAGS[:2]
 if "sel_plats" not in st.session_state: 
-    st.session_state.sel_plats = ["Instagram", "YouTube"]
+    st.session_state.sel_plats = ["Instagram Reels", "YouTube Shorts", "YouTube Videos"]
 if "per_tag" not in st.session_state: 
     st.session_state.per_tag = 50
 if "sort_mode" not in st.session_state: 
     st.session_state.sort_mode = "Engagement ↓"
+if "fresh_refresh" not in st.session_state:
+    st.session_state.fresh_refresh = True
 
 # ── STYLES ────────────────────────────────────────────────────────────────────
 st.markdown("""
@@ -469,21 +495,25 @@ st.markdown("""
 .ct{font-size:11.5px;font-weight:600;color:#1e293b;line-height:1.3;margin:4px 0;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;}
 .cm{font-size:10.5px;color:#64748b;margin:2px 0;}
 .pb-ig{display:inline-block;padding:2px 6px;border-radius:4px;font-size:8.5px;font-weight:700;color:#fff;background:#e1306c;}
-.pb-yt{display:inline-block;padding:2px 6px;border-radius:4px;font-size:8.5px;font-weight:700;color:#fff;background:#ff0000;}
+.pb-yts{display:inline-block;padding:2px 6px;border-radius:4px;font-size:8.5px;font-weight:700;color:#fff;background:#ff0000;}
+.pb-ytv{display:inline-block;padding:2px 6px;border-radius:4px;font-size:8.5px;font-weight:700;color:#fff;background:#cc0000;}
 .ca{display:inline-block;padding:2px 8px;border-radius:11px;font-size:9.5px;background:#f0f4ff;color:#4361ee;margin-top:4px;}
 </style>""", unsafe_allow_html=True)
 
 st.markdown('<div class="hero"><div class="hero-t">📱 Social Trend Tracker Pro</div>'
-            '<div class="hero-s">Crash-Proof Low-Memory Engine • Multi-Tag Support • Session Concurrency</div></div>',
+            '<div class="hero-s">Exact Hashtag Scraper • YouTube Shorts Segregation • Internal Sorting</div></div>',
             unsafe_allow_html=True)
 
 # ── SIDEBAR ───────────────────────────────────────────────────────────────────
 with st.sidebar:
     st.title("⚙️ Controls")
     
-    # Check Cookie Status Warning
     if not IG_SESSIONID:
         st.warning("⚠️ IG_SESSIONID is missing in Secrets. Instagram scraping may trigger a login redirect.")
+
+    fresh_refresh = st.checkbox("🔄 Fresh Scrape (Replace Stored Data)", value=st.session_state.fresh_refresh,
+                                help="Wipes previous data on each run so results only contain exact matches for your current tags.")
+    st.session_state.fresh_refresh = fresh_refresh
 
     custom_input = st.text_input("+ Custom Tags (comma-separated)", placeholder="kurtilovers, kurti, ethnicwear")
     if custom_input:
@@ -507,15 +537,17 @@ with st.sidebar:
     if new_t != st.session_state.sel_tags: 
         st.session_state.sel_tags = new_t
             
-    new_p = st.multiselect("Platforms", ["Instagram", "YouTube"], default=st.session_state.sel_plats)
+    new_p = st.multiselect("Platforms & Content Types", 
+                           ["Instagram Reels", "YouTube Shorts", "YouTube Videos"], 
+                           default=st.session_state.sel_plats)
     if new_p != st.session_state.sel_plats: st.session_state.sel_plats = new_p
     
     new_n = st.slider("Posts per hashtag per platform", 10, 500, st.session_state.per_tag, step=10)
     if new_n != st.session_state.per_tag: st.session_state.per_tag = new_n
     
     st.divider()
-    new_sort = st.radio("Sort / Rank by", ["Engagement ↓", "Most Recent ↓"], 
-                        index=["Engagement ↓", "Most Recent ↓"].index(st.session_state.sort_mode))
+    new_sort = st.selectbox("Sort / Rank Grid By", SORT_OPTIONS, 
+                            index=SORT_OPTIONS.index(st.session_state.sort_mode))
     if new_sort != st.session_state.sort_mode: st.session_state.sort_mode = new_sort
     
     st.divider()
@@ -542,10 +574,10 @@ if scrape_btn and sel_tags:
         prog_bar.empty()
         
         if new_recs:
-            save_user_records(new_recs)
-            status_box.success(f"✅ Deep Scrape Completed! Extracted {len(new_recs)} records.")
+            save_user_records(new_recs, replace=st.session_state.fresh_refresh)
+            status_box.success(f"✅ Scrape Completed! Extracted {len(new_recs)} exact matching records.")
         else:
-            status_box.warning("⚠️ Scrape finished, but 0 Instagram records were retrieved. Ensure your IG_SESSIONID secret is valid.")
+            status_box.warning("⚠️ Scrape finished, but 0 records were retrieved. Ensure your IG_SESSIONID secret is valid.")
         
         time.sleep(1)
         st.rerun()
@@ -566,27 +598,56 @@ df["views"] = pd.to_numeric(df.get("views", None), errors="coerce")
 df["likes"] = pd.to_numeric(df.get("likes", None), errors="coerce")
 df["uploaded_at"] = pd.to_datetime(df.get("posted_on", ""), errors="coerce")
 
-df_sel = df[df["hashtag"].isin({f"#{t}" for t in sel_tags})].copy()
-if df_sel.empty: df_sel = df.copy()
+# Strict Exact Tag Case Normalization
+active_tags_set = {f"#{t.lower().strip('#')}" for t in sel_tags}
+df["hashtag_lower"] = df["hashtag"].astype(str).str.lower().str.strip()
+
+# Filtering by exact selected tags
+df_sel = df[df["hashtag_lower"].isin(active_tags_set)].copy()
 
 st.markdown("---")
-cat_opts = ["All"] + sorted([str(c) for c in df_sel["category"].unique()])
-cf_val = st.selectbox("Filter by Category", cat_opts)
+
+# Quick Controls Bar above tabs
+qc1, qc2, qc3 = st.columns([1, 1, 1])
+with qc1:
+    cat_opts = ["All"] + sorted([str(c) for c in df_sel["category"].unique()])
+    cf_val = st.selectbox("Filter Category", cat_opts, key="main_cat_filter")
+with qc2:
+    grid_sort = st.selectbox("Sort Grid By", SORT_OPTIONS, 
+                             index=SORT_OPTIONS.index(st.session_state.sort_mode), key="main_grid_sort")
+    if grid_sort != st.session_state.sort_mode:
+        st.session_state.sort_mode = grid_sort
+        st.rerun()
 
 dff = df_sel.copy()
 if sel_plats: dff = dff[dff["platform"].isin(sel_plats)]
 if cf_val != "All": dff = dff[dff["category"] == cf_val]
 
-csv_b = io.StringIO(); dff.to_csv(csv_b, index=False)
-st.download_button("⬇️ Export CSV", csv_b.getvalue(), "trends.csv", "text/csv")
+with qc3:
+    csv_b = io.StringIO(); dff.to_csv(csv_b, index=False)
+    st.markdown("<div style='padding-top:25px;'></div>", unsafe_allow_html=True)
+    st.download_button("⬇️ Export Data CSV", csv_b.getvalue(), "trends.csv", "text/csv", use_container_width=True)
 
-if dff.empty: st.info("No data matches selected filters."); st.stop()
+if dff.empty: 
+    st.info("No stored posts match the selected active tags. Click 'Scrape Deep Feed' to pull records for these tags.")
+    st.stop()
 
+# Dynamic Internal Sorting Logic
 def apply_sort(data_df):
-    if st.session_state.sort_mode == "Engagement ↓":
-        return data_df.sort_values("engagement", ascending=False)
-    else:
-        return data_df.sort_values("uploaded_at", ascending=False, na_position="last")
+    sort_mode = st.session_state.sort_mode
+    d_sorted = data_df.copy()
+    
+    if sort_mode == "Engagement ↓":
+        return d_sorted.sort_values("engagement", ascending=False)
+    elif sort_mode == "Most Recent ↓":
+        return d_sorted.sort_values("uploaded_at", ascending=False, na_position="last")
+    elif sort_mode == "Platform (Grouped)":
+        return d_sorted.sort_values(["platform", "engagement"], ascending=[True, False])
+    elif sort_mode == "Views ↓":
+        return d_sorted.sort_values("views", ascending=False, na_position="last")
+    elif sort_mode == "Likes ↓":
+        return d_sorted.sort_values("likes", ascending=False, na_position="last")
+    return d_sorted
 
 def fv(v):
     if v is None or pd.isna(v): return "—"
@@ -598,14 +659,20 @@ def fv(v):
 def render_grid(data, label, max_n=500):
     if data.empty: st.info("No posts for this view."); return
     d = apply_sort(data).head(max_n).reset_index(drop=True)
-    st.caption(f"Displaying **{len(d)}** posts.")
+    st.caption(f"Displaying **{len(d)}** posts (Sorted by **{st.session_state.sort_mode}**).")
     
     for i in range(0, len(d), 4):
         cols = st.columns(4)
         for j, (_, r) in enumerate(d.iloc[i:i+4].iterrows()):
             with cols[j]:
                 plat = r.get("platform", "")
-                badge_class = "pb-ig" if plat == "Instagram" else "pb-yt"
+                if plat == "Instagram Reels":
+                    badge_class = "pb-ig"
+                elif plat == "YouTube Shorts":
+                    badge_class = "pb-yts"
+                else:
+                    badge_class = "pb-ytv"
+                    
                 thumb = r.get("thumbnail", "")
                 
                 if thumb:
@@ -630,7 +697,7 @@ def render_grid(data, label, max_n=500):
                     <div class="cm">{metric}</div>
                     <div class="ca">🏷 {r.get("category","")}</div>
                 </div><br>""", unsafe_allow_html=True)
-                st.link_button(f"Open {plat} ↗", r.get("url", "#"), use_container_width=True)
+                st.link_button(f"Open Link ↗", r.get("url", "#"), use_container_width=True)
 
 # ── TIME WINDOW TABS ──────────────────────────────────────────────────────────
 now = datetime.now()
@@ -656,9 +723,9 @@ with t_stats:
     st.subheader("📊 Performance Summary")
     s1, s2, s3, s4 = st.columns(4)
     with s1: st.metric("Total Items", len(dff))
-    with s2: st.metric("Instagram", len(dff[dff["platform"] == "Instagram"]))
-    with s3: st.metric("YouTube", len(dff[dff["platform"] == "YouTube"]))
-    with s4: st.metric("Categories", dff["category"].nunique())
+    with s2: st.metric("Instagram Reels", len(dff[dff["platform"] == "Instagram Reels"]))
+    with s3: st.metric("YouTube Shorts", len(dff[dff["platform"] == "YouTube Shorts"]))
+    with s4: st.metric("YouTube Videos", len(dff[dff["platform"] == "YouTube Videos"]))
     st.divider()
     st.markdown("#### Top Categories by Items")
     st.bar_chart(dff["category"].value_counts())
