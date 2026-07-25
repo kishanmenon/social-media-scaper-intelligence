@@ -1,7 +1,8 @@
 """
 social_trend_app.py
 Unified Social Trend Tracker Pro:
-- Strictly Independent Limits: Instagram Reels (N), YouTube Shorts (N), YouTube Videos (N).
+- Fixed YouTube Shorts DOM Extraction: Directly targets Shorts links with multi-tier title fallbacks.
+- Strictly Independent Quotas: Instagram Reels (N), YouTube Shorts (N), YouTube Videos (N).
 - Fixed Time Window Filtering (L30d, L7d, L24h, Lifetime) with relative date parsing.
 - Internal Sorting: Sort by Platform (Grouped), Engagement, Recency, Views, or Likes.
 - Fresh Scrape / Replace Mode for a 100% complete refresh on each run.
@@ -320,7 +321,7 @@ def scrape_ig_deep_sync(ctx, tag, limit=50, status_container=None):
 
     return items_scraped
 
-# ── DEEP INFINITE SCROLL SCRAPER (YOUTUBE: INDEPENDENT SHORTS & VIDEOS QUOTAS) ─
+# ── DEEP INFINITE SCROLL SCRAPER (YOUTUBE: REFACTORED SHORTS & VIDEOS EXTRACTION) ─
 def scrape_yt_deep_sync(ctx, tag, limit=50, status_container=None, fetch_shorts=True, fetch_videos=True):
     shorts_rows = []
     videos_rows = []
@@ -329,91 +330,98 @@ def scrape_yt_deep_sync(ctx, tag, limit=50, status_container=None, fetch_shorts=
     clean_tag = tag.lower().strip("#")
     
     try:
+        # Open YouTube's dedicated Hashtag page
         page.goto(f"https://www.youtube.com/hashtag/{clean_tag}", wait_until="domcontentloaded", timeout=25000)
-        time.sleep(2)
+        time.sleep(2.5)
         
         max_scrolls = max(15, limit // 2)
         no_new_count = 0
         
         for scroll_idx in range(max_scrolls):
             page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-            time.sleep(1.0)
+            time.sleep(1.2)
             
-            vids = page.query_selector_all("ytd-rich-item-renderer, ytd-video-renderer, ytd-reel-item-renderer")
+            # Direct Anchor Query for Shorts and Videos
+            anchors = page.locator("a[href*='/shorts/'], a[href*='/watch']").all()
             initial_count = len(seen_ids)
             
-            for v in vids:
-                t_el = v.query_selector("#video-title, a#video-title, span#video-title")
-                if not t_el: continue
-                title = (t_el.inner_text()).strip()
-                if not title: continue
-                
-                href = t_el.get_attribute("href") or ""
-                if not href:
-                    parent_a = v.query_selector("a[href*='/shorts/'], a[href*='/watch']")
-                    if parent_a: href = parent_a.get_attribute("href") or ""
+            for a in anchors:
+                try:
+                    href = a.get_attribute("href") or ""
+                    is_short = "/shorts/" in href
+                    
+                    # Respect Quota Checks
+                    if is_short:
+                        if not fetch_shorts or len(shorts_rows) >= limit: continue
+                    else:
+                        if not fetch_videos or len(videos_rows) >= limit: continue
 
-                is_short = "/shorts/" in href
-                
-                # Strict Independent Quota Checks
-                if is_short:
-                    if not fetch_shorts or len(shorts_rows) >= limit: continue
-                else:
-                    if not fetch_videos or len(videos_rows) >= limit: continue
+                    vid_m = re.search(r"(?:v=|/shorts/)([A-Za-z0-9_-]{11})", href)
+                    vid_id = vid_m.group(1) if vid_m else ""
+                    if not vid_id or vid_id in seen_ids: continue
 
-                vid_m = re.search(r"(?:v=|/shorts/)([A-Za-z0-9_-]{11})", href)
-                vid_id = vid_m.group(1) if vid_m else ""
-                if not vid_id or vid_id in seen_ids: continue
-                seen_ids.add(vid_id)
+                    # Resilient Title Extraction Fallback
+                    title = a.get_attribute("title") or a.get_attribute("aria-label") or ""
+                    if not title or len(title) < 2:
+                        title = a.inner_text().strip()
+                    
+                    # Parent Container Search if anchor title is empty
+                    if not title or len(title) < 2:
+                        parent = a.locator("xpath=ancestor::ytd-rich-item-renderer | ancestor::ytd-video-renderer | ancestor::ytd-reel-item-renderer").first
+                        if parent.count():
+                            t_el = parent.locator("#video-title, #title, span.yt-core-attributed-string").first
+                            if t_el.count():
+                                title = t_el.inner_text().strip()
+                    
+                    if not title or len(title) < 2:
+                        title = f"#{clean_tag} {'Short' if is_short else 'Video'}"
 
-                views = None
-                raw_posted_str = ""
-                spans = v.query_selector_all("#metadata-line span, span.inline-metadata-item")
-                for span in spans:
-                    st_text = (span.inner_text()).strip()
-                    vm = re.search(r"([\d,\.]+(?:[\s\u00a0]+(?:crore|lakh))?[KMB]?)\s*views?", st_text, re.I)
-                    if vm and not views:
-                        views = parse_num(vm.group(1).strip())
-                    if "ago" in st_text.lower():
-                        raw_posted_str = st_text
-                        
-                if not views:
-                    aria = t_el.get_attribute("aria-label") or ""
-                    vm2 = re.search(r"([\d,\.]+(?:[\s\u00a0]+(?:crore|lakh))?[KMB]?)\s*views?", aria, re.I)
-                    if vm2: views = parse_num(vm2.group(1).strip())
-                    if not raw_posted_str:
-                        m_aria_ago = re.search(r"\d+\s*(?:second|minute|hour|day|week|month|year)s?\s*ago", aria, re.I)
-                        if m_aria_ago: raw_posted_str = m_aria_ago.group(0)
+                    seen_ids.add(vid_id)
 
-                posted_on = parse_relative_date(raw_posted_str)
+                    # Extract Views & Date from Parent Card Container
+                    views = None
+                    raw_posted_str = ""
+                    
+                    parent_card = a.locator("xpath=ancestor::ytd-rich-item-renderer | ancestor::ytd-video-renderer | ancestor::ytd-reel-item-renderer").first
+                    if parent_card.count():
+                        spans = parent_card.locator("#metadata-line span, span.inline-metadata-item, #metadata span").all()
+                        for span in spans:
+                            st_text = span.inner_text().strip()
+                            vm = re.search(r"([\d,\.]+(?:[\s\u00a0]+(?:crore|lakh))?[KMB]?)\s*views?", st_text, re.I)
+                            if vm and not views:
+                                views = parse_num(vm.group(1).strip())
+                            if "ago" in st_text.lower():
+                                raw_posted_str = st_text
 
-                ch = v.query_selector("#channel-name a, ytd-channel-name a")
-                channel = (ch.inner_text()).strip() if ch else ""
-                thumb = f"https://img.youtube.com/vi/{vid_id}/mqdefault.jpg"
-                platform_name = "YouTube Shorts" if is_short else "YouTube Videos"
+                    posted_on = parse_relative_date(raw_posted_str)
+                    thumb = f"https://img.youtube.com/vi/{vid_id}/mqdefault.jpg"
+                    platform_name = "YouTube Shorts" if is_short else "YouTube Videos"
 
-                item_rec = {
-                    "platform": platform_name,
-                    "content_type": "Shorts" if is_short else "Video",
-                    "hashtag": f"#{clean_tag}",
-                    "title": title.replace('\n', ' '),
-                    "description": "",
-                    "url": fmt("https://www.youtube.com", href),
-                    "views": views,
-                    "likes": None,
-                    "comments": None,
-                    "engagement": views or 0,
-                    "creator": channel,
-                    "thumbnail": thumb,
-                    "posted_on": posted_on,
-                    "category": classify_category(f"{title} {clean_tag}"),
-                    "scraped_at": datetime.now().isoformat()
-                }
+                    item_rec = {
+                        "platform": platform_name,
+                        "content_type": "Shorts" if is_short else "Video",
+                        "hashtag": f"#{clean_tag}",
+                        "title": title.replace('\n', ' ')[:120],
+                        "description": "",
+                        "url": f"https://www.youtube.com{' /shorts/' + vid_id if is_short else '/watch?v=' + vid_id}",
+                        "views": views,
+                        "likes": None,
+                        "comments": None,
+                        "engagement": views or 0,
+                        "creator": "",
+                        "thumbnail": thumb,
+                        "posted_on": posted_on,
+                        "category": classify_category(f"{title} {clean_tag}"),
+                        "scraped_at": datetime.now().isoformat()
+                    }
 
-                if is_short:
-                    shorts_rows.append(item_rec)
-                else:
-                    videos_rows.append(item_rec)
+                    if is_short:
+                        shorts_rows.append(item_rec)
+                    else:
+                        videos_rows.append(item_rec)
+
+                except Exception:
+                    continue
 
             if status_container:
                 msg_parts = []
@@ -421,7 +429,6 @@ def scrape_yt_deep_sync(ctx, tag, limit=50, status_container=None, fetch_shorts=
                 if fetch_videos: msg_parts.append(f"Videos: {len(videos_rows)}/{limit}")
                 status_container.info(f"▶️ YT #{clean_tag}: Discovered " + " | ".join(msg_parts))
 
-            # Stop scrolling once all requested targets are fulfilled
             shorts_fulfilled = (not fetch_shorts) or (len(shorts_rows) >= limit)
             videos_fulfilled = (not fetch_videos) or (len(videos_rows) >= limit)
             if shorts_fulfilled and videos_fulfilled:
