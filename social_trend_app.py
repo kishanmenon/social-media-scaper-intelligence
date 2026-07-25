@@ -1,10 +1,11 @@
 """
 social_trend_app.py
 Unified Social Trend Tracker Pro:
+- Authenticated YouTube Scraping: Uses YT_COOKIE to bypass bot/consent walls.
 - Fixed HTML Escaping (UI cards no longer break on special characters).
-- Improved YouTube DOM targeting for seamless Shorts extraction.
-- Dynamic error messaging based on platform.
 - Strictly Independent Quotas for Reels, Shorts, and Videos.
+- Fixed Time Window Filtering (L30d, L7d, L24h, Lifetime) with relative date parsing.
+- Internal Sorting: Sort by Platform (Grouped), Engagement, Recency, Views, or Likes.
 - Fresh Scrape / Replace Mode for exact matching.
 """
 import streamlit as st
@@ -32,6 +33,7 @@ def secret(k, d=""):
 
 IG_SESSIONID = secret("IG_SESSIONID")
 IG_CSRFTOKEN = secret("IG_CSRFTOKEN")
+YT_COOKIE = secret("YT_COOKIE")  # New YouTube Cookie Secret
 
 # ── CATEGORY CLASSIFIER ───────────────────────────────────────────────────────
 _CATEGORY_RULES = [
@@ -131,6 +133,12 @@ def parse_relative_date(text: str) -> str:
         if pd.notna(dt): return dt.isoformat()
     except Exception: pass
     return datetime.now().isoformat()
+
+def fmt(domain, link):
+    if not link: return ""
+    link = link.strip()
+    if link.startswith("http"): return link
+    return f"{domain}{link}" if link.startswith("/") else f"{domain}/{link}"
 
 # ── SESSION DATA MANAGEMENT ────────────────────────────────────────────────────
 def get_user_records():
@@ -319,6 +327,11 @@ def scrape_yt_deep_sync(ctx, tag, limit=50, status_container=None, fetch_shorts=
         page.goto(f"https://www.youtube.com/hashtag/{clean_tag}", wait_until="domcontentloaded", timeout=30000)
         time.sleep(3)
         
+        # Check if YouTube is showing a consent/bot wall
+        if "consent" in page.url or page.locator("form[action*='consent']").count() > 0:
+            if status_container:
+                status_container.warning(f"⚠️ YT #{clean_tag}: YouTube showed a consent wall. Ensure YT_COOKIE is valid.")
+            
         max_scrolls = max(20, limit // 2)
         no_new_count = 0
         
@@ -326,7 +339,6 @@ def scrape_yt_deep_sync(ctx, tag, limit=50, status_container=None, fetch_shorts=
             page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
             time.sleep(1.5)
             
-            # Target standard videos + shorts shelves
             vids = page.query_selector_all("ytd-rich-item-renderer, ytd-video-renderer, ytd-reel-item-renderer")
             initial_count = len(seen_ids)
             
@@ -380,10 +392,7 @@ def scrape_yt_deep_sync(ctx, tag, limit=50, status_container=None, fetch_shorts=
                 channel = ch.inner_text().strip() if ch else ""
                 thumb = f"https://img.youtube.com/vi/{vid_id}/mqdefault.jpg"
                 
-                # Dynamic Platform Assignment
                 platform_name = "YouTube Shorts" if is_short else "YouTube Videos"
-                
-                # Build correct URL
                 video_url = f"https://www.youtube.com{'/shorts/' + vid_id if is_short else '/watch?v=' + vid_id}"
 
                 item_rec = {
@@ -460,6 +469,21 @@ def execute_sync_scrape(hashtags, platforms, per_tag, status_box, progress_bar):
         cks = []
         if IG_SESSIONID: cks.append({"name": "sessionid", "value": IG_SESSIONID, "domain": ".instagram.com", "path": "/", "httpOnly": True, "secure": True, "sameSite": "Lax"})
         if IG_CSRFTOKEN: cks.append({"name": "csrftoken", "value": IG_CSRFTOKEN, "domain": ".instagram.com", "path": "/", "secure": True, "sameSite": "Lax"})
+        
+        # Parse and inject YouTube raw cookie string
+        if YT_COOKIE:
+            for c_item in YT_COOKIE.split(";"):
+                if "=" in c_item:
+                    k, v = c_item.strip().split("=", 1)
+                    cks.append({
+                        "name": k,
+                        "value": v,
+                        "domain": ".youtube.com",
+                        "path": "/",
+                        "secure": True,
+                        "sameSite": "Lax"
+                    })
+
         if cks: ctx.add_cookies(cks)
 
         total_tags = len(hashtags)
@@ -541,7 +565,7 @@ st.markdown("""
 </style>""", unsafe_allow_html=True)
 
 st.markdown('<div class="hero"><div class="hero-t">📱 Social Trend Tracker Pro</div>'
-            '<div class="hero-s">Independent Quotas per Content Type • Exact Hashtag Feed Scraping • Multi-Sorting</div></div>',
+            '<div class="hero-s">Authenticated Scraping (YT_COOKIE) • Protected UI Cards • Exact Matching</div></div>',
             unsafe_allow_html=True)
 
 # ── SIDEBAR ───────────────────────────────────────────────────────────────────
@@ -549,7 +573,9 @@ with st.sidebar:
     st.title("⚙️ Controls")
     
     if not IG_SESSIONID:
-        st.warning("⚠️ IG_SESSIONID is missing in Secrets. Instagram scraping may trigger a login redirect.")
+        st.warning("⚠️ IG_SESSIONID is missing in Secrets. Instagram scraping may fail.")
+    if not YT_COOKIE:
+        st.info("ℹ️ YT_COOKIE is missing. YouTube scraping might hit bot-protection limits.")
 
     fresh_refresh = st.checkbox("🔄 Fresh Scrape (Replace Stored Data)", value=st.session_state.fresh_refresh,
                                 help="Wipes previous data on each run so results only contain exact matches for your current tags.")
@@ -617,7 +643,7 @@ if scrape_btn and sel_tags:
             save_user_records(new_recs, replace=st.session_state.fresh_refresh)
             status_box.success(f"✅ Scrape Completed! Extracted {len(new_recs)} exact matching records.")
         else:
-            status_box.warning("⚠️ Scrape finished, but 0 records were retrieved. (If scraping Instagram, check IG_SESSIONID. For YouTube, try a broader hashtag).")
+            status_box.warning("⚠️ Scrape finished, but 0 records were retrieved. Ensure your IG/YT cookies are active.")
         
         time.sleep(2)
         st.rerun()
