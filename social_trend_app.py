@@ -1,10 +1,10 @@
 """
 social_trend_app.py
 Unified Social Trend Tracker Pro:
-- Native Hashtag Feed Targeting: Uses /hashtag/tag/shorts to securely target exactly what you need.
+- Fixed Markdown Indentation Bug (UI cards render clean HTML instead of raw code blocks).
+- Direct URL Filter Approach: Uses YouTube search parameter tokens (sp=...).
 - Safe Cookie Injection (Bypasses Playwright __Secure- strict validation crashes).
 - Authenticated YouTube Scraping: Uses YT_COOKIE to bypass bot/consent walls.
-- Fixed HTML Escaping (UI cards no longer break on special characters).
 - Strictly Independent Quotas for Reels, Shorts, and Videos.
 - Fresh Scrape / Replace Mode for exact matching.
 """
@@ -315,7 +315,7 @@ def scrape_ig_deep_sync(ctx, tag, limit=50, status_container=None):
 
     return items_scraped
 
-# ── DEEP INFINITE SCROLL SCRAPER (YOUTUBE NATIVE ENDPOINTS) ───────────────────
+# ── DEEP INFINITE SCROLL SCRAPER (YOUTUBE: DIRECT URL FILTER TOKENS) ───────────
 def scrape_yt_deep_sync(ctx, tag, limit=50, status_container=None, fetch_shorts=True, fetch_videos=True):
     clean_tag = tag.lower().strip("#")
     all_rows = []
@@ -325,23 +325,16 @@ def scrape_yt_deep_sync(ctx, tag, limit=50, status_container=None, fetch_shorts=
         seen_ids = set()
         page = ctx.new_page()
         try:
-            # Use Native YouTube Hashtag Feeds
+            # YouTube native filter tokens:
+            # sp=EgIYAw%3D%3D locks the search results strictly to Shorts
+            # sp=EgIQAQ%3D%3D locks the search results strictly to Videos
             if target_type == "Shorts":
-                target_url = f"https://www.youtube.com/hashtag/{clean_tag}/shorts"
+                target_url = f"https://www.youtube.com/results?search_query=%23{clean_tag}&sp=EgIYAw%3D%3D"
             else:
-                target_url = f"https://www.youtube.com/hashtag/{clean_tag}"
+                target_url = f"https://www.youtube.com/results?search_query=%23{clean_tag}&sp=EgIQAQ%3D%3D"
 
             page.goto(target_url, wait_until="domcontentloaded", timeout=30000)
             time.sleep(2.5)
-            
-            # If grabbing videos, physically click the "Videos" chip just in case YouTube defaults to "All"
-            if target_type == "Videos":
-                try:
-                    chip = page.locator("yt-chip-cloud-chip-renderer").get_by_text("Videos", exact=True).first
-                    if chip.count() > 0:
-                        chip.click()
-                        time.sleep(2)
-                except: pass
 
             max_scrolls = max(20, limit // 2)
             no_new_count = 0
@@ -436,7 +429,7 @@ def scrape_yt_deep_sync(ctx, tag, limit=50, status_container=None, fetch_shorts=
                     no_new_count = 0
 
         except Exception as e:
-            if status_container: status_container.error(f"YT Playwright Error ({target_type}): {e}")
+            print(f"YT Exception ({target_type}): {e}")
         finally:
             try: page.close()
             except Exception: pass
@@ -572,7 +565,7 @@ st.markdown("""
 </style>""", unsafe_allow_html=True)
 
 st.markdown('<div class="hero"><div class="hero-t">📱 Social Trend Tracker Pro</div>'
-            '<div class="hero-s">Native Endpoint Access • Independent Quotas • Exact Matching</div></div>',
+            '<div class="hero-s">Direct URL Token Filtering • Independent Quotas • Exact Matching</div></div>',
             unsafe_allow_html=True)
 
 # ── SIDEBAR ───────────────────────────────────────────────────────────────────
@@ -756,24 +749,30 @@ def render_grid(data, label, max_n=500):
                 safe_title = html.escape(str(raw_title))
                 
                 raw_creator = r.get("creator", "")
-                safe_creator = f"👤 {html.escape(str(raw_creator))}" if raw_creator else ""
+                safe_creator = html.escape(str(raw_creator))
+                creator_div = f"<div class='cm'>👤 {safe_creator}</div>" if safe_creator else ""
                 
                 posted = str(r.get('posted_on', ''))[:10]
-                posted_str = f"🕐 {posted}" if posted else ""
+                posted_div = f"<div class='cm'>🕐 {posted}</div>" if posted else ""
                 
                 metric = "  ·  ".join(filter(None, [
                     f"👁 {fv(r.get('views'))}" if not pd.isna(r.get('views')) else None,
                     f"❤️ {fv(r.get('likes'))}" if not pd.isna(r.get('likes')) else None
                 ])) or f"Eng: {fv(r.get('engagement'))}"
                 
-                st.markdown(f"""<div class="cb">
-                    <div><span class="{badge_class}">{plat}</span> <span style="color:#4361ee;font-size:9px">{r.get("hashtag","")}</span></div>
-                    <div class="ct">{safe_title}</div>
-                    {"<div class='cm'>"+safe_creator+"</div>" if safe_creator else ""}
-                    {"<div class='cm'>"+posted_str+"</div>" if posted_str else ""}
-                    <div class="cm">{metric}</div>
-                    <div class="ca">🏷 {r.get("category","")}</div>
-                </div><br>""", unsafe_allow_html=True)
+                # Construct HTML without any leading indentation to prevent Streamlit from rendering it as a Markdown code block
+                html_str = (
+                    f'<div class="cb">'
+                    f'<div><span class="{badge_class}">{plat}</span> <span style="color:#4361ee;font-size:9px">{r.get("hashtag","")}</span></div>'
+                    f'<div class="ct">{safe_title}</div>'
+                    f'{creator_div}'
+                    f'{posted_div}'
+                    f'<div class="cm">{metric}</div>'
+                    f'<div class="ca">🏷 {r.get("category","")}</div>'
+                    f'</div><br>'
+                )
+                
+                st.markdown(html_str, unsafe_allow_html=True)
                 st.link_button(f"Open Link ↗", r.get("url", "#"), use_container_width=True)
 
 # ── TIME WINDOW TABS ──────────────────────────────────────────────────────────
