@@ -1,8 +1,8 @@
 """
 social_trend_app.py
 Unified Social Trend Tracker Pro:
-- Deep Scroll Fix: Uses keyboard events and higher patience timeouts to force YouTube's lazy-loader.
-- Bulletproof Tab Clicking: Ensures Videos tab is clicked to prevent Shorts dilution.
+- PERFECTED YT ENDPOINTS: Uses /hashtag/tag/shorts and /hashtag/tag/videos natively!
+- Deep Scroll Fix: Uses keyboard events to force YouTube's lazy-loader.
 - Fixed HTML tiles with no Markdown indentation bugs.
 - Authenticated YouTube Scraping: Uses YT_COOKIE to bypass bot/consent walls.
 - Strictly Independent Quotas for Reels, Shorts, and Videos.
@@ -324,28 +324,14 @@ def scrape_yt_deep_sync(ctx, tag, limit=50, status_container=None, fetch_shorts=
         seen_ids = set()
         page = ctx.new_page()
         try:
-            # Native YouTube Hashtag Feeds
+            # PERFECTED Native YouTube Hashtag Feeds using the direct /shorts and /videos paths
             if target_type == "Shorts":
                 target_url = f"https://www.youtube.com/hashtag/{clean_tag}/shorts"
             else:
-                target_url = f"https://www.youtube.com/hashtag/{clean_tag}"
+                target_url = f"https://www.youtube.com/hashtag/{clean_tag}/videos?app=desktop"
 
             page.goto(target_url, wait_until="domcontentloaded", timeout=30000)
             time.sleep(3.0)
-            
-            # Robust extraction of the "Videos" tab to prevent Shorts from polluting the scrape
-            if target_type == "Videos":
-                try:
-                    for selector in [
-                        "yt-chip-cloud-chip-renderer:has-text('Videos')",
-                        "//yt-chip-cloud-chip-renderer[contains(., 'Videos')]"
-                    ]:
-                        chip = page.locator(selector).first
-                        if chip.count() > 0:
-                            chip.click()
-                            time.sleep(3.0)
-                            break
-                except: pass
 
             # High patience variables to force YouTube's lazy-loader
             max_scrolls = max(40, limit)
