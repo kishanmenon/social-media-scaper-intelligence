@@ -1,8 +1,9 @@
 """
 social_trend_app.py
 Unified Social Trend Tracker Pro:
-- RESTORED: Native Hashtag Feed Targeting (/hashtag/tag/shorts).
-- RESTORED: Fixed HTML tiles with no Markdown indentation bugs.
+- Deep Scroll Fix: Uses keyboard events and higher patience timeouts to force YouTube's lazy-loader.
+- Bulletproof Tab Clicking: Ensures Videos tab is clicked to prevent Shorts dilution.
+- Fixed HTML tiles with no Markdown indentation bugs.
 - Authenticated YouTube Scraping: Uses YT_COOKIE to bypass bot/consent walls.
 - Strictly Independent Quotas for Reels, Shorts, and Videos.
 """
@@ -249,12 +250,12 @@ def scrape_ig_deep_sync(ctx, tag, limit=50, status_container=None):
         main_el = page.locator("main")
         grid_scope = main_el if main_el.count() else page
 
-        max_scroll_attempts = max(12, limit // 2)
+        max_scroll_attempts = max(20, limit)
         no_new_items_count = 0
         
         for scroll_idx in range(max_scroll_attempts):
             page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-            time.sleep(1.0)
+            time.sleep(1.2)
 
             links = grid_scope.locator("a[href*='/reel/'], a[href*='/p/']").all()
             initial_count = len(seen_codes)
@@ -280,7 +281,7 @@ def scrape_ig_deep_sync(ctx, tag, limit=50, status_container=None):
             
             if len(seen_codes) == initial_count:
                 no_new_items_count += 1
-                if no_new_items_count >= 3: break
+                if no_new_items_count >= 4: break
             else:
                 no_new_items_count = 0
 
@@ -313,7 +314,7 @@ def scrape_ig_deep_sync(ctx, tag, limit=50, status_container=None):
 
     return items_scraped
 
-# ── DEEP INFINITE SCROLL SCRAPER (YOUTUBE: DIRECT NATIVE HASHTAG FEED) ─────────
+# ── DEEP INFINITE SCROLL SCRAPER (YOUTUBE NATIVE ENDPOINTS) ───────────────────
 def scrape_yt_deep_sync(ctx, tag, limit=50, status_container=None, fetch_shorts=True, fetch_videos=True):
     clean_tag = tag.lower().strip("#")
     all_rows = []
@@ -323,30 +324,39 @@ def scrape_yt_deep_sync(ctx, tag, limit=50, status_container=None, fetch_shorts=
         seen_ids = set()
         page = ctx.new_page()
         try:
-            # RESTORED: Native YouTube Hashtag Feeds instead of general Search
+            # Native YouTube Hashtag Feeds
             if target_type == "Shorts":
                 target_url = f"https://www.youtube.com/hashtag/{clean_tag}/shorts"
             else:
                 target_url = f"https://www.youtube.com/hashtag/{clean_tag}"
 
             page.goto(target_url, wait_until="domcontentloaded", timeout=30000)
-            time.sleep(2.5)
+            time.sleep(3.0)
             
-            # If grabbing videos, physically click the "Videos" chip just in case YouTube defaults to "All"
+            # Robust extraction of the "Videos" tab to prevent Shorts from polluting the scrape
             if target_type == "Videos":
                 try:
-                    chip = page.locator("yt-chip-cloud-chip-renderer").get_by_text("Videos", exact=True).first
-                    if chip.count() > 0:
-                        chip.click()
-                        time.sleep(2)
+                    for selector in [
+                        "yt-chip-cloud-chip-renderer:has-text('Videos')",
+                        "//yt-chip-cloud-chip-renderer[contains(., 'Videos')]"
+                    ]:
+                        chip = page.locator(selector).first
+                        if chip.count() > 0:
+                            chip.click()
+                            time.sleep(3.0)
+                            break
                 except: pass
 
-            max_scrolls = max(20, limit // 2)
+            # High patience variables to force YouTube's lazy-loader
+            max_scrolls = max(40, limit)
             no_new_count = 0
             
             for scroll_idx in range(max_scrolls):
-                page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-                time.sleep(1.5)
+                # Trigger network fetches using keyboard and deep JS scrolling
+                page.keyboard.press("End")
+                time.sleep(0.5)
+                page.evaluate("window.scrollBy(0, 10000)")
+                time.sleep(2.5)  # Extended wait to allow slow lazy-loading
                 
                 vids = page.query_selector_all("ytd-rich-item-renderer, ytd-video-renderer, ytd-reel-item-renderer")
                 initial_count = len(seen_ids)
@@ -427,9 +437,10 @@ def scrape_yt_deep_sync(ctx, tag, limit=50, status_container=None, fetch_shorts=
 
                 if len(rows) >= limit: break
                 
+                # Increased Patience Threshold (Wait 5 cycles / 12+ seconds before giving up)
                 if len(seen_ids) == initial_count:
                     no_new_count += 1
-                    if no_new_count >= 3: break
+                    if no_new_count >= 5: break
                 else:
                     no_new_count = 0
 
