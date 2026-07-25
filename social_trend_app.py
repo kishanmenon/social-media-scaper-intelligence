@@ -1,7 +1,7 @@
 """
 social_trend_app.py
 Unified Social Trend Tracker Pro:
-- Dual-Pass YouTube Scraper: Physically clicks "Shorts" and "Videos" tabs to guarantee strict quota yields.
+- Direct URL Filter Approach: Uses YouTube search parameter tokens (sp=...) to pull Shorts and Videos independently and reliably.
 - Safe Cookie Injection (Bypasses Playwright __Secure- strict validation crashes).
 - Authenticated YouTube Scraping: Uses YT_COOKIE to bypass bot/consent walls.
 - Fixed HTML Escaping (UI cards no longer break on special characters).
@@ -315,27 +315,26 @@ def scrape_ig_deep_sync(ctx, tag, limit=50, status_container=None):
 
     return items_scraped
 
-# ── DEEP INFINITE SCROLL SCRAPER (YOUTUBE: ISOLATED DUAL-PASS) ─────────────────
+# ── DEEP INFINITE SCROLL SCRAPER (YOUTUBE: DIRECT URL FILTER TOKENS) ───────────
 def scrape_yt_deep_sync(ctx, tag, limit=50, status_container=None, fetch_shorts=True, fetch_videos=True):
     clean_tag = tag.lower().strip("#")
     all_rows = []
 
-    def perform_yt_pass(target_type):
+    def perform_yt_url_pass(target_type):
         rows = []
         seen_ids = set()
         page = ctx.new_page()
         try:
-            page.goto(f"https://www.youtube.com/hashtag/{clean_tag}", wait_until="domcontentloaded", timeout=30000)
+            # YouTube native filter tokens:
+            # sp=EgIYAw%3D%3D locks the search results strictly to Shorts
+            # sp=EgIQAQ%3D%3D locks the search results strictly to Videos
+            if target_type == "Shorts":
+                target_url = f"https://www.youtube.com/results?search_query=%23{clean_tag}&sp=EgIYAw%3D%3D"
+            else:
+                target_url = f"https://www.youtube.com/results?search_query=%23{clean_tag}&sp=EgIQAQ%3D%3D"
+
+            page.goto(target_url, wait_until="domcontentloaded", timeout=30000)
             time.sleep(2.5)
-            
-            # Physically click the dedicated Shorts or Videos Chip/Tab
-            try:
-                chip = page.locator("yt-chip-cloud-chip-renderer").get_by_text(target_type, exact=True).first
-                if chip.count() > 0:
-                    chip.click()
-                    time.sleep(2)
-            except Exception:
-                pass
 
             max_scrolls = max(20, limit // 2)
             no_new_count = 0
@@ -354,7 +353,6 @@ def scrape_yt_deep_sync(ctx, tag, limit=50, status_container=None, fetch_shorts=
                     href = a.get_attribute("href") or ""
                     is_short = "/shorts/" in href
                     
-                    # Strict Type Enforcement based on Pass
                     if target_type == "Shorts" and not is_short: continue
                     if target_type == "Videos" and is_short: continue
 
@@ -439,9 +437,9 @@ def scrape_yt_deep_sync(ctx, tag, limit=50, status_container=None, fetch_shorts=
         return rows
 
     if fetch_shorts:
-        all_rows.extend(perform_yt_pass("Shorts"))
+        all_rows.extend(perform_yt_url_pass("Shorts"))
     if fetch_videos:
-        all_rows.extend(perform_yt_pass("Videos"))
+        all_rows.extend(perform_yt_url_pass("Videos"))
         
     return all_rows
 
@@ -567,7 +565,7 @@ st.markdown("""
 </style>""", unsafe_allow_html=True)
 
 st.markdown('<div class="hero"><div class="hero-t">📱 Social Trend Tracker Pro</div>'
-            '<div class="hero-s">Authenticated Scraping (YT_COOKIE) • Protected UI Cards • Exact Matching</div></div>',
+            '<div class="hero-s">Direct URL Token Filtering • Independent Quotas • Exact Matching</div></div>',
             unsafe_allow_html=True)
 
 # ── SIDEBAR ───────────────────────────────────────────────────────────────────
