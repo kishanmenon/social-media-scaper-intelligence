@@ -1,6 +1,8 @@
 """
 social_trend_app.py
 Unified Social Trend Tracker Pro:
+- Safe Cookie Injection (Bypasses Playwright __Secure- strict validation crashes).
+- On-Screen Error Logging for background thread crashes.
 - Authenticated YouTube Scraping: Uses YT_COOKIE to bypass bot/consent walls.
 - Fixed HTML Escaping (UI cards no longer break on special characters).
 - Strictly Independent Quotas for Reels, Shorts, and Videos.
@@ -33,7 +35,7 @@ def secret(k, d=""):
 
 IG_SESSIONID = secret("IG_SESSIONID")
 IG_CSRFTOKEN = secret("IG_CSRFTOKEN")
-YT_COOKIE = secret("YT_COOKIE")  # New YouTube Cookie Secret
+YT_COOKIE = secret("YT_COOKIE")
 
 # ── CATEGORY CLASSIFIER ───────────────────────────────────────────────────────
 _CATEGORY_RULES = [
@@ -287,7 +289,7 @@ def scrape_ig_deep_sync(ctx, tag, limit=50, status_container=None):
                 no_new_items_count = 0
 
     except Exception as e:
-        print(f"IG Grid Exception: {e}")
+        if status_container: status_container.error(f"IG Playwright Error: {e}")
     finally:
         try: page.close()
         except Exception: pass
@@ -327,7 +329,7 @@ def scrape_yt_deep_sync(ctx, tag, limit=50, status_container=None, fetch_shorts=
         page.goto(f"https://www.youtube.com/hashtag/{clean_tag}", wait_until="domcontentloaded", timeout=30000)
         time.sleep(3)
         
-        # Check if YouTube is showing a consent/bot wall
+        # Check if YouTube is showing a consent/bot wall despite cookies
         if "consent" in page.url or page.locator("form[action*='consent']").count() > 0:
             if status_container:
                 status_container.warning(f"⚠️ YT #{clean_tag}: YouTube showed a consent wall. Ensure YT_COOKIE is valid.")
@@ -339,6 +341,7 @@ def scrape_yt_deep_sync(ctx, tag, limit=50, status_container=None, fetch_shorts=
             page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
             time.sleep(1.5)
             
+            # Target standard videos + shorts shelves
             vids = page.query_selector_all("ytd-rich-item-renderer, ytd-video-renderer, ytd-reel-item-renderer")
             initial_count = len(seen_ids)
             
@@ -392,6 +395,7 @@ def scrape_yt_deep_sync(ctx, tag, limit=50, status_container=None, fetch_shorts=
                 channel = ch.inner_text().strip() if ch else ""
                 thumb = f"https://img.youtube.com/vi/{vid_id}/mqdefault.jpg"
                 
+                # Dynamic Platform Assignment
                 platform_name = "YouTube Shorts" if is_short else "YouTube Videos"
                 video_url = f"https://www.youtube.com{'/shorts/' + vid_id if is_short else '/watch?v=' + vid_id}"
 
@@ -436,7 +440,7 @@ def scrape_yt_deep_sync(ctx, tag, limit=50, status_container=None, fetch_shorts=
                 no_new_count = 0
 
     except Exception as e:
-        print(f"YT Exception: {e}")
+        if status_container: status_container.error(f"YT Playwright Error: {e}")
     finally:
         try: page.close()
         except Exception: pass
@@ -467,10 +471,11 @@ def execute_sync_scrape(hashtags, platforms, per_tag, status_box, progress_bar):
         )
 
         cks = []
-        if IG_SESSIONID: cks.append({"name": "sessionid", "value": IG_SESSIONID, "domain": ".instagram.com", "path": "/", "httpOnly": True, "secure": True, "sameSite": "Lax"})
-        if IG_CSRFTOKEN: cks.append({"name": "csrftoken", "value": IG_CSRFTOKEN, "domain": ".instagram.com", "path": "/", "secure": True, "sameSite": "Lax"})
         
-        # Parse and inject YouTube raw cookie string
+        # Safely map URL domains to avoid strict Playwright Security crashes
+        if IG_SESSIONID: cks.append({"name": "sessionid", "value": IG_SESSIONID, "url": "https://www.instagram.com"})
+        if IG_CSRFTOKEN: cks.append({"name": "csrftoken", "value": IG_CSRFTOKEN, "url": "https://www.instagram.com"})
+        
         if YT_COOKIE:
             for c_item in YT_COOKIE.split(";"):
                 if "=" in c_item:
@@ -478,13 +483,14 @@ def execute_sync_scrape(hashtags, platforms, per_tag, status_box, progress_bar):
                     cks.append({
                         "name": k,
                         "value": v,
-                        "domain": ".youtube.com",
-                        "path": "/",
-                        "secure": True,
-                        "sameSite": "Lax"
+                        "url": "https://www.youtube.com"
                     })
 
-        if cks: ctx.add_cookies(cks)
+        if cks: 
+            try:
+                ctx.add_cookies(cks)
+            except Exception as e:
+                if status_box: status_box.error(f"Cookie Injection Error: Check format in secrets. Details: {e}")
 
         total_tags = len(hashtags)
         for i, tag in enumerate(hashtags):
