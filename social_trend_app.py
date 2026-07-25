@@ -1,11 +1,11 @@
 """
 social_trend_app.py
 Unified Social Trend Tracker Pro:
+- Strictly Independent Limits: Instagram Reels (N), YouTube Shorts (N), YouTube Videos (N).
+- Fixed Time Window Filtering (L30d, L7d, L24h, Lifetime) with relative date parsing.
 - Internal Sorting: Sort by Platform (Grouped), Engagement, Recency, Views, or Likes.
 - Fresh Scrape / Replace Mode for a 100% complete refresh on each run.
-- Explicit Segregation: Instagram Reels, YouTube Shorts, and YouTube Videos.
 - Strict Exact Tag Matching: Eliminates partial tag leakage.
-- Low-memory Playwright execution for Streamlit Cloud stability.
 """
 import streamlit as st
 import os, re, json, gc, time, io, subprocess, sys
@@ -113,6 +113,31 @@ def parse_num(s):
         return int(n * {"K":1000,"M":1_000_000,"B":1_000_000_000}.get(m.group(2),1))
     except Exception: return None
 
+def parse_relative_date(text: str) -> str:
+    """Parses relative time strings like '5 hours ago', '3 days ago' into ISO Datetime"""
+    if not text:
+        return datetime.now().isoformat()
+    
+    text_clean = str(text).lower().strip()
+    m = re.search(r"(\d+)\s*(second|minute|hour|day|week|month|year)s?\s*ago", text_clean, re.I)
+    if m:
+        val = int(m.group(1))
+        unit = m.group(2).lower()
+        seconds_map = {
+            "second": 1, "minute": 60, "hour": 3600,
+            "day": 86400, "week": 604800, "month": 2592000, "year": 31536000
+        }
+        secs = val * seconds_map.get(unit, 86400)
+        return (datetime.now() - timedelta(seconds=secs)).isoformat()
+    
+    try:
+        dt = pd.to_datetime(text_clean, errors="coerce")
+        if pd.notna(dt):
+            return dt.isoformat()
+    except Exception: pass
+    
+    return datetime.now().isoformat()
+
 def fmt(domain, link):
     if not link: return ""
     link = link.strip()
@@ -212,8 +237,8 @@ def fetch_ig_metadata_graphql(shortcode: str, tag: str):
         }
     except Exception: return None
 
-# ── DEEP INFINITE SCROLL SCRAPER (INSTAGRAM) ──────────────────────────────────
-def scrape_ig_deep_sync(ctx, tag, limit=100, status_container=None):
+# ── DEEP INFINITE SCROLL SCRAPER (INSTAGRAM REELS) ────────────────────────────
+def scrape_ig_deep_sync(ctx, tag, limit=50, status_container=None):
     page = ctx.new_page()
     found_reels = []
     seen_codes = set()
@@ -231,7 +256,7 @@ def scrape_ig_deep_sync(ctx, tag, limit=100, status_container=None):
         main_el = page.locator("main")
         grid_scope = main_el if main_el.count() else page
 
-        max_scroll_attempts = max(10, limit // 3)
+        max_scroll_attempts = max(12, limit // 2)
         no_new_items_count = 0
         
         for scroll_idx in range(max_scroll_attempts):
@@ -257,7 +282,7 @@ def scrape_ig_deep_sync(ctx, tag, limit=100, status_container=None):
                         if len(found_reels) >= limit: break
             
             if status_container:
-                status_container.info(f"📸 IG #{clean_tag}: Discovered {len(found_reels)}/{limit} links...")
+                status_container.info(f"📸 IG #{clean_tag}: Discovered {len(found_reels)}/{limit} Reels...")
             if len(found_reels) >= limit: break
             
             if len(seen_codes) == initial_count:
@@ -295,104 +320,126 @@ def scrape_ig_deep_sync(ctx, tag, limit=100, status_container=None):
 
     return items_scraped
 
-# ── DEEP INFINITE SCROLL SCRAPER (YOUTUBE: SHORTS vs VIDEOS) ───────────────────
-def scrape_yt_deep_sync(ctx, tag, limit=100, status_container=None, fetch_shorts=True, fetch_videos=True):
-    rows = []
+# ── DEEP INFINITE SCROLL SCRAPER (YOUTUBE: INDEPENDENT SHORTS & VIDEOS QUOTAS) ─
+def scrape_yt_deep_sync(ctx, tag, limit=50, status_container=None, fetch_shorts=True, fetch_videos=True):
+    shorts_rows = []
+    videos_rows = []
     page = ctx.new_page()
     seen_ids = set()
     clean_tag = tag.lower().strip("#")
     
     try:
-        page.goto(f"https://www.youtube.com/results?search_query=%23{clean_tag}", wait_until="domcontentloaded", timeout=25000)
+        page.goto(f"https://www.youtube.com/hashtag/{clean_tag}", wait_until="domcontentloaded", timeout=25000)
         time.sleep(2)
         
-        max_scrolls = max(10, limit // 4)
+        max_scrolls = max(15, limit // 2)
+        no_new_count = 0
+        
         for scroll_idx in range(max_scrolls):
             page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
             time.sleep(1.0)
             
-            vids = page.query_selector_all("ytd-video-renderer,ytd-rich-item-renderer,ytd-reel-item-renderer")
-            if status_container:
-                status_container.info(f"▶️ YT #{clean_tag}: Discovered {len(vids)} items...")
-            if len(vids) >= limit * 2: break
-
-        vids = page.query_selector_all("ytd-video-renderer,ytd-rich-item-renderer,ytd-reel-item-renderer")
-        for v in vids:
-            t_el = v.query_selector("#video-title,a#video-title,span#video-title")
-            if not t_el: continue
-            title = (t_el.inner_text()).strip()
-            if not title: continue
+            vids = page.query_selector_all("ytd-rich-item-renderer, ytd-video-renderer, ytd-reel-item-renderer")
+            initial_count = len(seen_ids)
             
-            href = t_el.get_attribute("href") or ""
-            if not href:
-                parent_a = v.query_selector("a[href*='/shorts/'], a[href*='/watch']")
-                if parent_a: href = parent_a.get_attribute("href") or ""
-
-            is_short = "/shorts/" in href
-            
-            # Segregation Filter Check
-            if is_short and not fetch_shorts: continue
-            if not is_short and not fetch_videos: continue
-
-            vid_m = re.search(r"(?:v=|/shorts/)([A-Za-z0-9_-]{11})", href)
-            vid_id = vid_m.group(1) if vid_m else ""
-            if not vid_id or vid_id in seen_ids: continue
-            seen_ids.add(vid_id)
-
-            views = None
-            spans = v.query_selector_all("#metadata-line span, span.inline-metadata-item")
-            for span in spans:
-                st_text = (span.inner_text()).strip()
-                vm = re.search(r"([\d,\.]+(?:[\s\u00a0]+(?:crore|lakh))?[KMB]?)\s*views?", st_text, re.I)
-                if vm:
-                    views = parse_num(vm.group(1).strip())
-                    if views: break
-            if not views:
-                aria = t_el.get_attribute("aria-label") or ""
-                vm2 = re.search(r"([\d,\.]+(?:[\s\u00a0]+(?:crore|lakh))?[KMB]?)\s*views?", aria, re.I)
-                if vm2: views = parse_num(vm2.group(1).strip())
+            for v in vids:
+                t_el = v.query_selector("#video-title, a#video-title, span#video-title")
+                if not t_el: continue
+                title = (t_el.inner_text()).strip()
+                if not title: continue
                 
-            posted_on = datetime.now().isoformat()
-            for span in spans:
-                st_text = (span.inner_text()).strip()
-                m2 = re.search(r"(\d+)\s*(second|minute|hour|day|week|month|year)s?\s*ago", st_text, re.I)
-                if m2:
-                    n2 = int(m2.group(1)); unit = m2.group(2).lower()
-                    delta_map = {"second": 1, "minute": 60, "hour": 3600, "day": 86400, "week": 604800, "month": 2592000, "year": 31536000}
-                    posted_on = (datetime.now() - timedelta(seconds=n2 * delta_map.get(unit, 86400))).isoformat()
-                    break
+                href = t_el.get_attribute("href") or ""
+                if not href:
+                    parent_a = v.query_selector("a[href*='/shorts/'], a[href*='/watch']")
+                    if parent_a: href = parent_a.get_attribute("href") or ""
 
-            ch = v.query_selector("#channel-name a,ytd-channel-name a")
-            channel = (ch.inner_text()).strip() if ch else ""
-            thumb = f"https://img.youtube.com/vi/{vid_id}/mqdefault.jpg" if vid_id else ""
+                is_short = "/shorts/" in href
+                
+                # Strict Independent Quota Checks
+                if is_short:
+                    if not fetch_shorts or len(shorts_rows) >= limit: continue
+                else:
+                    if not fetch_videos or len(videos_rows) >= limit: continue
 
-            platform_name = "YouTube Shorts" if is_short else "YouTube Videos"
+                vid_m = re.search(r"(?:v=|/shorts/)([A-Za-z0-9_-]{11})", href)
+                vid_id = vid_m.group(1) if vid_m else ""
+                if not vid_id or vid_id in seen_ids: continue
+                seen_ids.add(vid_id)
 
-            rows.append({
-                "platform": platform_name,
-                "content_type": "Shorts" if is_short else "Video",
-                "hashtag": f"#{clean_tag}",
-                "title": title.replace('\n', ' '),
-                "description": "",
-                "url": fmt("https://www.youtube.com", href),
-                "views": views,
-                "likes": None,
-                "comments": None,
-                "engagement": views or 0,
-                "creator": channel,
-                "thumbnail": thumb,
-                "posted_on": posted_on,
-                "category": classify_category(f"{title} {clean_tag}"),
-                "scraped_at": datetime.now().isoformat()
-            })
-            if len(rows) >= limit: break
+                views = None
+                raw_posted_str = ""
+                spans = v.query_selector_all("#metadata-line span, span.inline-metadata-item")
+                for span in spans:
+                    st_text = (span.inner_text()).strip()
+                    vm = re.search(r"([\d,\.]+(?:[\s\u00a0]+(?:crore|lakh))?[KMB]?)\s*views?", st_text, re.I)
+                    if vm and not views:
+                        views = parse_num(vm.group(1).strip())
+                    if "ago" in st_text.lower():
+                        raw_posted_str = st_text
+                        
+                if not views:
+                    aria = t_el.get_attribute("aria-label") or ""
+                    vm2 = re.search(r"([\d,\.]+(?:[\s\u00a0]+(?:crore|lakh))?[KMB]?)\s*views?", aria, re.I)
+                    if vm2: views = parse_num(vm2.group(1).strip())
+                    if not raw_posted_str:
+                        m_aria_ago = re.search(r"\d+\s*(?:second|minute|hour|day|week|month|year)s?\s*ago", aria, re.I)
+                        if m_aria_ago: raw_posted_str = m_aria_ago.group(0)
+
+                posted_on = parse_relative_date(raw_posted_str)
+
+                ch = v.query_selector("#channel-name a, ytd-channel-name a")
+                channel = (ch.inner_text()).strip() if ch else ""
+                thumb = f"https://img.youtube.com/vi/{vid_id}/mqdefault.jpg"
+                platform_name = "YouTube Shorts" if is_short else "YouTube Videos"
+
+                item_rec = {
+                    "platform": platform_name,
+                    "content_type": "Shorts" if is_short else "Video",
+                    "hashtag": f"#{clean_tag}",
+                    "title": title.replace('\n', ' '),
+                    "description": "",
+                    "url": fmt("https://www.youtube.com", href),
+                    "views": views,
+                    "likes": None,
+                    "comments": None,
+                    "engagement": views or 0,
+                    "creator": channel,
+                    "thumbnail": thumb,
+                    "posted_on": posted_on,
+                    "category": classify_category(f"{title} {clean_tag}"),
+                    "scraped_at": datetime.now().isoformat()
+                }
+
+                if is_short:
+                    shorts_rows.append(item_rec)
+                else:
+                    videos_rows.append(item_rec)
+
+            if status_container:
+                msg_parts = []
+                if fetch_shorts: msg_parts.append(f"Shorts: {len(shorts_rows)}/{limit}")
+                if fetch_videos: msg_parts.append(f"Videos: {len(videos_rows)}/{limit}")
+                status_container.info(f"▶️ YT #{clean_tag}: Discovered " + " | ".join(msg_parts))
+
+            # Stop scrolling once all requested targets are fulfilled
+            shorts_fulfilled = (not fetch_shorts) or (len(shorts_rows) >= limit)
+            videos_fulfilled = (not fetch_videos) or (len(videos_rows) >= limit)
+            if shorts_fulfilled and videos_fulfilled:
+                break
+            
+            if len(seen_ids) == initial_count:
+                no_new_count += 1
+                if no_new_count >= 3: break
+            else:
+                no_new_count = 0
 
     except Exception as e:
         print(f"YT Exception: {e}")
     finally:
         try: page.close()
         except Exception: pass
-    return rows
+
+    return shorts_rows + videos_rows
 
 # ── SYNCHRONOUS SCRAPE EXECUTION ──────────────────────────────────────────────
 def execute_sync_scrape(hashtags, platforms, per_tag, status_box, progress_bar):
@@ -501,7 +548,7 @@ st.markdown("""
 </style>""", unsafe_allow_html=True)
 
 st.markdown('<div class="hero"><div class="hero-t">📱 Social Trend Tracker Pro</div>'
-            '<div class="hero-s">Exact Hashtag Scraper • YouTube Shorts Segregation • Internal Sorting</div></div>',
+            '<div class="hero-s">Independent Quotas per Content Type • Exact Hashtag Feed Scraping • Multi-Sorting</div></div>',
             unsafe_allow_html=True)
 
 # ── SIDEBAR ───────────────────────────────────────────────────────────────────
@@ -542,7 +589,7 @@ with st.sidebar:
                            default=st.session_state.sel_plats)
     if new_p != st.session_state.sel_plats: st.session_state.sel_plats = new_p
     
-    new_n = st.slider("Posts per hashtag per platform", 10, 500, st.session_state.per_tag, step=10)
+    new_n = st.slider("Posts PER HASHTAG per content type", 10, 500, st.session_state.per_tag, step=10)
     if new_n != st.session_state.per_tag: st.session_state.per_tag = new_n
     
     st.divider()
@@ -598,7 +645,7 @@ df["views"] = pd.to_numeric(df.get("views", None), errors="coerce")
 df["likes"] = pd.to_numeric(df.get("likes", None), errors="coerce")
 df["uploaded_at"] = pd.to_datetime(df.get("posted_on", ""), errors="coerce")
 
-# Strict Exact Tag Case Normalization
+# Exact Tag Normalization
 active_tags_set = {f"#{t.lower().strip('#')}" for t in sel_tags}
 df["hashtag_lower"] = df["hashtag"].astype(str).str.lower().str.strip()
 
@@ -607,7 +654,6 @@ df_sel = df[df["hashtag_lower"].isin(active_tags_set)].copy()
 
 st.markdown("---")
 
-# Quick Controls Bar above tabs
 qc1, qc2, qc3 = st.columns([1, 1, 1])
 with qc1:
     cat_opts = ["All"] + sorted([str(c) for c in df_sel["category"].unique()])
@@ -632,7 +678,6 @@ if dff.empty:
     st.info("No stored posts match the selected active tags. Click 'Scrape Deep Feed' to pull records for these tags.")
     st.stop()
 
-# Dynamic Internal Sorting Logic
 def apply_sort(data_df):
     sort_mode = st.session_state.sort_mode
     d_sorted = data_df.copy()
@@ -657,7 +702,7 @@ def fv(v):
     return str(v)
 
 def render_grid(data, label, max_n=500):
-    if data.empty: st.info("No posts for this view."); return
+    if data.empty: st.info("No posts found for this time window."); return
     d = apply_sort(data).head(max_n).reset_index(drop=True)
     st.caption(f"Displaying **{len(d)}** posts (Sorted by **{st.session_state.sort_mode}**).")
     
@@ -701,10 +746,11 @@ def render_grid(data, label, max_n=500):
 
 # ── TIME WINDOW TABS ──────────────────────────────────────────────────────────
 now = datetime.now()
-ua = pd.to_datetime(dff["uploaded_at"], errors="coerce")
-d30 = dff[ua.notna() & (ua >= now - timedelta(days=30))]
-d7  = dff[ua.notna() & (ua >= now - timedelta(days=7))]
+ua = dff["uploaded_at"]
+
 d1  = dff[ua.notna() & (ua >= now - timedelta(days=1))]
+d7  = dff[ua.notna() & (ua >= now - timedelta(days=7))]
+d30 = dff[ua.notna() & (ua >= now - timedelta(days=30))]
 
 t_l30, t_l7, t_l1, t_all, t_stats = st.tabs([
     f"📅 L30 Days ({len(d30)})",
