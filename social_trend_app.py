@@ -1,7 +1,7 @@
 """
 social_trend_app.py
 Unified Social Trend Tracker Pro:
-- Direct URL Filter Approach: Uses YouTube search parameter tokens (sp=...) to pull Shorts and Videos independently and reliably.
+- Native Hashtag Feed Targeting: Uses /hashtag/tag/shorts to securely target exactly what you need.
 - Safe Cookie Injection (Bypasses Playwright __Secure- strict validation crashes).
 - Authenticated YouTube Scraping: Uses YT_COOKIE to bypass bot/consent walls.
 - Fixed HTML Escaping (UI cards no longer break on special characters).
@@ -315,7 +315,7 @@ def scrape_ig_deep_sync(ctx, tag, limit=50, status_container=None):
 
     return items_scraped
 
-# ── DEEP INFINITE SCROLL SCRAPER (YOUTUBE: DIRECT URL FILTER TOKENS) ───────────
+# ── DEEP INFINITE SCROLL SCRAPER (YOUTUBE NATIVE ENDPOINTS) ───────────────────
 def scrape_yt_deep_sync(ctx, tag, limit=50, status_container=None, fetch_shorts=True, fetch_videos=True):
     clean_tag = tag.lower().strip("#")
     all_rows = []
@@ -325,16 +325,23 @@ def scrape_yt_deep_sync(ctx, tag, limit=50, status_container=None, fetch_shorts=
         seen_ids = set()
         page = ctx.new_page()
         try:
-            # YouTube native filter tokens:
-            # sp=EgIYAw%3D%3D locks the search results strictly to Shorts
-            # sp=EgIQAQ%3D%3D locks the search results strictly to Videos
+            # Use Native YouTube Hashtag Feeds
             if target_type == "Shorts":
-                target_url = f"https://www.youtube.com/results?search_query=%23{clean_tag}&sp=EgIYAw%3D%3D"
+                target_url = f"https://www.youtube.com/hashtag/{clean_tag}/shorts"
             else:
-                target_url = f"https://www.youtube.com/results?search_query=%23{clean_tag}&sp=EgIQAQ%3D%3D"
+                target_url = f"https://www.youtube.com/hashtag/{clean_tag}"
 
             page.goto(target_url, wait_until="domcontentloaded", timeout=30000)
             time.sleep(2.5)
+            
+            # If grabbing videos, physically click the "Videos" chip just in case YouTube defaults to "All"
+            if target_type == "Videos":
+                try:
+                    chip = page.locator("yt-chip-cloud-chip-renderer").get_by_text("Videos", exact=True).first
+                    if chip.count() > 0:
+                        chip.click()
+                        time.sleep(2)
+                except: pass
 
             max_scrolls = max(20, limit // 2)
             no_new_count = 0
@@ -429,7 +436,7 @@ def scrape_yt_deep_sync(ctx, tag, limit=50, status_container=None, fetch_shorts=
                     no_new_count = 0
 
         except Exception as e:
-            print(f"YT Exception ({target_type}): {e}")
+            if status_container: status_container.error(f"YT Playwright Error ({target_type}): {e}")
         finally:
             try: page.close()
             except Exception: pass
@@ -565,7 +572,7 @@ st.markdown("""
 </style>""", unsafe_allow_html=True)
 
 st.markdown('<div class="hero"><div class="hero-t">📱 Social Trend Tracker Pro</div>'
-            '<div class="hero-s">Direct URL Token Filtering • Independent Quotas • Exact Matching</div></div>',
+            '<div class="hero-s">Native Endpoint Access • Independent Quotas • Exact Matching</div></div>',
             unsafe_allow_html=True)
 
 # ── SIDEBAR ───────────────────────────────────────────────────────────────────
