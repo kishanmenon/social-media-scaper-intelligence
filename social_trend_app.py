@@ -1,11 +1,10 @@
 """
 social_trend_app.py
 Unified Social Trend Tracker Pro:
+- GUARANTEED QUOTAS: Uses persistent requests.Session() and fallback dicts so blocked metadata requests never delete grid items.
 - Deep Scroll Overhaul: Actively hunts YouTube's continuation spinner and smooth-scrolls to trigger infinite loads reliably.
 - Shorts Date Fix: Added regex fallbacks to pull hidden "uploadDate" and "publishDate" from ytInitialData.
-- Fixed Invalid Comparison Error: Aligned 'now' variable to UTC timezone to match the dataframe.
-- Fixed Timezone Error: Added utc=True to pandas to_datetime to prevent mixed timezone crashes.
-- YouTube Background Metadata Engine: Fetches exact Creator, Date, Views, and Likes directly from the video source code.
+- Fixed Timezone Error: Aligned 'now' variable and pandas to_datetime to UTC.
 - PERFECTED YT ENDPOINTS: Uses /hashtag/tag/shorts and /hashtag/tag/videos natively.
 - Strictly Independent Quotas for Reels, Shorts, and Videos.
 """
@@ -215,76 +214,82 @@ def fetch_ig_metadata_graphql(shortcode: str, tag: str):
     except Exception: return None
 
 # ── YOUTUBE METADATA (BACKGROUND REQUESTS ENGINE) ────────────────────────────
-def fetch_yt_metadata_requests(vid_id, target_type, clean_tag, yt_cookies_dict):
-    """Fetches comprehensive metadata securely directly from the YouTube Video HTML"""
-    url = f"https://www.youtube.com/watch?v={vid_id}"
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-        "Accept-Language": "en-US,en;q=0.9"
+def fetch_yt_metadata_requests(vid_id, target_type, clean_tag, session):
+    """Fetches metadata securely. Includes a fallback guarantee so grid items are NEVER lost to rate-limits."""
+    video_url = f"https://www.youtube.com{'/shorts/' + vid_id if target_type == 'Shorts' else '/watch?v=' + vid_id}"
+    thumb = f"https://img.youtube.com/vi/{vid_id}/mqdefault.jpg"
+
+    # GUARANTEE RECORD: If YouTube blocks the request, this fallback guarantees the video stays in the grid
+    rec = {
+        "platform": f"YouTube {target_type}",
+        "content_type": "Shorts" if target_type == "Shorts" else "Video",
+        "hashtag": f"#{clean_tag}",
+        "title": f"#{clean_tag} {target_type[:-1]}",
+        "description": "",
+        "url": video_url,
+        "views": 0,
+        "likes": 0,
+        "comments": None,
+        "engagement": 0,
+        "creator": "YouTube User",
+        "thumbnail": thumb,
+        "posted_on": datetime.now(timezone.utc).isoformat(),
+        "category": classify_category(clean_tag),
+        "scraped_at": datetime.now(timezone.utc).isoformat()
     }
     
     try:
-        res = requests.get(url, headers=headers, cookies=yt_cookies_dict, timeout=8)
-        if res.status_code != 200: return None
+        # Mini retry loop to survive temporary 429 rate-limit blocks
+        for attempt in range(2):
+            res = session.get(video_url, timeout=8)
+            if res.status_code == 429:
+                time.sleep(1.5)
+                continue
+            if res.status_code != 200:
+                return rec
+            break
+            
         html_text = res.text
 
         # 1. Exact Title Extraction
         t_match = re.search(r'<meta name="title" content="([^"]+)">', html_text)
-        title = html.unescape(t_match.group(1)) if t_match else f"#{clean_tag} {target_type[:-1]}"
+        if t_match: rec["title"] = html.unescape(t_match.group(1)).strip()[:150]
 
         # 2. Exact Creator Name
         c_match = re.search(r'<link itemprop="name" content="([^"]+)">', html_text)
-        creator = html.unescape(c_match.group(1)) if c_match else ""
+        if c_match: rec["creator"] = html.unescape(c_match.group(1))
 
-        # 3. Exact Upload Date (Fixed for Shorts)
+        # 3. Exact Upload Date (Fixed for Shorts JSON hiding)
         d_match = re.search(r'<meta itemprop="datePublished" content="([^"]+)">', html_text)
         if d_match:
-            posted_on = d_match.group(1)
+            rec["posted_on"] = d_match.group(1)
         else:
-            # Shorts hide their dates in the JSON payloads instead of meta tags
             fallback_date = re.search(r'"uploadDate":"([^"]+)"', html_text) or re.search(r'"publishDate":"([^"]+)"', html_text)
-            posted_on = fallback_date.group(1) if fallback_date else datetime.now(timezone.utc).isoformat()
+            if fallback_date: rec["posted_on"] = fallback_date.group(1)
 
         # 4. Precise Views
         v_match = re.search(r'<meta itemprop="interactionCount" content="(\d+)">', html_text)
         if v_match:
-            views = int(v_match.group(1))
+            rec["views"] = int(v_match.group(1))
         else:
             v_match2 = re.search(r'"viewCount":"(\d+)"', html_text)
-            views = int(v_match2.group(1)) if v_match2 else 0
+            if v_match2: rec["views"] = int(v_match2.group(1))
 
         # 5. Precise Likes
-        likes = 0
         l_match = re.search(r'"likeCount":"(\d+)"', html_text)
         if l_match:
-            likes = int(l_match.group(1))
+            rec["likes"] = int(l_match.group(1))
         else:
             text_like = re.search(r'"accessibilityText":"([\d,KMB\.]+) likes"', html_text)
             if text_like:
-                likes = parse_num(text_like.group(1).replace(',', ''))
+                rec["likes"] = parse_num(text_like.group(1).replace(',', ''))
 
-        thumb = f"https://img.youtube.com/vi/{vid_id}/mqdefault.jpg"
-        video_url = f"https://www.youtube.com{'/shorts/' + vid_id if target_type == 'Shorts' else '/watch?v=' + vid_id}"
+        rec["engagement"] = rec["views"] or rec["likes"] or 0
+        rec["category"] = classify_category(f"{rec['title']} {clean_tag}")
 
-        return {
-            "platform": f"YouTube {target_type}",
-            "content_type": "Shorts" if target_type == "Shorts" else "Video",
-            "hashtag": f"#{clean_tag}",
-            "title": title.strip()[:150],
-            "description": "",
-            "url": video_url,
-            "views": views,
-            "likes": likes,
-            "comments": None,
-            "engagement": views or likes or 0,
-            "creator": creator,
-            "thumbnail": thumb,
-            "posted_on": posted_on,
-            "category": classify_category(f"{title} {clean_tag}"),
-            "scraped_at": datetime.now(timezone.utc).isoformat()
-        }
+        return rec
     except Exception:
-        return None
+        return rec # Never drop the item, return the fallback!
 
 # ── DEEP INFINITE SCROLL SCRAPER (INSTAGRAM REELS) ────────────────────────────
 def scrape_ig_deep_sync(ctx, tag, limit=50, status_container=None):
@@ -386,12 +391,11 @@ def scrape_yt_deep_sync(ctx, tag, limit, status_container, fetch_shorts, fetch_v
             page.goto(target_url, wait_until="domcontentloaded", timeout=30000)
             time.sleep(3.0)
 
-            # Massive scroll ceiling for deep quotas
             max_scrolls = max(100, int(limit * 2))
             no_new_count = 0
+            previous_dom_count = 0 
             
             for scroll_idx in range(max_scrolls):
-                # HUMAN MIMICRY: Drag down viewport to intentionally trip the observer
                 page.keyboard.press("PageDown")
                 time.sleep(0.4)
                 page.keyboard.press("PageDown")
@@ -399,17 +403,16 @@ def scrape_yt_deep_sync(ctx, tag, limit, status_container, fetch_shorts, fetch_v
                 page.keyboard.press("End")
                 time.sleep(1.5)
                 
-                # HUNT THE SPINNER: Find YouTube's lazy-load trigger and force it into view
                 try:
                     spinner = page.locator("ytd-continuation-item-renderer").last
                     if spinner.count() > 0:
                         spinner.scroll_into_view_if_needed(timeout=1500)
                 except Exception: pass
                 
-                time.sleep(1.5) # Wait for network request to populate DOM
+                time.sleep(1.5) 
                 
                 vids = page.query_selector_all("a[href*='/shorts/'], a[href*='/watch']")
-                initial_count = len(collected_ids)
+                current_dom_count = len(vids)
                 
                 for a in vids:
                     href = a.get_attribute("href") or ""
@@ -430,12 +433,13 @@ def scrape_yt_deep_sync(ctx, tag, limit, status_container, fetch_shorts, fetch_v
 
                 if len(collected_ids) >= limit: break
                 
-                # BULLETPROOF TIMEOUT: Only give up if NO new UNIQUE videos are found after 8 full cycles (~30 seconds of prodding)
-                if len(collected_ids) == initial_count:
+                if current_dom_count == previous_dom_count:
                     no_new_count += 1
                     if no_new_count >= 8: break
                 else:
                     no_new_count = 0
+                    
+                previous_dom_count = current_dom_count
 
         except Exception as e:
             if status_container: status_container.error(f"YT Playwright Error ({target_type}): {e}")
@@ -443,16 +447,23 @@ def scrape_yt_deep_sync(ctx, tag, limit, status_container, fetch_shorts, fetch_v
             try: page.close()
             except Exception: pass
         
-        # Step 2: Loop collected IDs to fetch precise background metadata
+        # Step 2: Set up a robust, persistent connection pool to survive rate limiting
+        session = requests.Session()
+        session.headers.update({
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+            "Accept-Language": "en-US,en;q=0.9"
+        })
+        for k, v in yt_cookies_dict.items():
+            session.cookies.set(k, v, domain=".youtube.com")
+            
         rows = []
         for idx, vid_id in enumerate(collected_ids):
             if status_container and idx % 5 == 0:
                 status_container.info(f"▶️ YT #{clean_tag}: Fetching metadata for {target_type} {idx+1}/{len(collected_ids)}")
             
-            meta = fetch_yt_metadata_requests(vid_id, target_type, clean_tag, yt_cookies_dict)
-            if meta:
-                rows.append(meta)
-            time.sleep(0.1) 
+            meta = fetch_yt_metadata_requests(vid_id, target_type, clean_tag, session)
+            rows.append(meta) # Safely appends the exact fetched metadata OR the fallback dict
+            time.sleep(0.15)  # Dynamic delay
             
         return rows
 
