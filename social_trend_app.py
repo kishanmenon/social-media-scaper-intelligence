@@ -1,12 +1,11 @@
 """
 social_trend_app.py
 Unified Social Trend Tracker Pro:
-- INSTANT VIDEO PASS: Extracts long-form video metadata directly from the Search DOM (Zero HTTP overhead).
 - HYBRID YT ENDPOINTS: Uses /hashtag/tag/shorts for Shorts, and /results with video-only filter for unlimited Video depth.
-- GUARANTEED QUOTAS: Uses persistent requests.Session() and fallback dicts so blocked metadata requests never delete Shorts.
+- GUARANTEED QUOTAS: Uses persistent requests.Session() and fallback dicts so blocked metadata requests never delete grid items.
 - Deep Scroll Overhaul: Actively hunts YouTube's continuation spinner and smooth-scrolls to trigger infinite loads reliably.
 - Shorts Date Fix: Added regex fallbacks to pull hidden "uploadDate" and "publishDate" from ytInitialData.
-- Fixed Timezone Error: Aligned 'now' variable and pandas to_datetime to UTC.
+- YT Video Date Bucketing Fix: Enhanced relative date parsing and robust UTC timestamp comparisons so L30d, L7d, L1d buckets populate accurately.
 - Strictly Independent Quotas for Reels, Shorts, and Videos.
 """
 import streamlit as st
@@ -119,6 +118,8 @@ def parse_num(s):
 def parse_relative_date(text: str) -> str:
     if not text: return datetime.now(timezone.utc).isoformat()
     text_clean = str(text).lower().strip()
+    
+    # Catch relative terms like "6 days ago", "1 month ago", "streamed 3 weeks ago"
     m = re.search(r"(\d+)\s*(second|minute|hour|day|week|month|year)s?\s*ago", text_clean, re.I)
     if m:
         val = int(m.group(1))
@@ -129,6 +130,7 @@ def parse_relative_date(text: str) -> str:
         }
         secs = val * seconds_map.get(unit, 86400)
         return (datetime.now(timezone.utc) - timedelta(seconds=secs)).isoformat()
+    
     try:
         dt = pd.to_datetime(text_clean, errors="coerce", utc=True)
         if pd.notna(dt): return dt.isoformat()
@@ -204,7 +206,7 @@ def fetch_ig_metadata_graphql(shortcode: str, tag: str):
         comments = item.get("comment_count")
         
         taken_at = item.get("taken_at")
-        posted_on = datetime.fromtimestamp(taken_at).isoformat() if taken_at else datetime.now(timezone.utc).isoformat()
+        posted_on = datetime.fromtimestamp(taken_at, tz=timezone.utc).isoformat() if taken_at else datetime.now(timezone.utc).isoformat()
 
         candidates = item.get("image_versions2", {}).get("candidates", [])
         thumb = item.get("display_uri") or (candidates[0].get("url") if candidates else "")
@@ -279,13 +281,14 @@ def fetch_yt_metadata_requests(vid_id, target_type, clean_tag, session):
         c_match = re.search(r'<link itemprop="name" content="([^"]+)">', html_text)
         if c_match: rec["creator"] = html.unescape(c_match.group(1))
 
-        # 3. Exact Upload Date (Fixed for Shorts JSON hiding)
+        # 3. Exact Upload Date Parsing (Supports ISO dates & fallback JSON strings)
         d_match = re.search(r'<meta itemprop="datePublished" content="([^"]+)">', html_text)
         if d_match:
-            rec["posted_on"] = d_match.group(1)
+            rec["posted_on"] = parse_relative_date(d_match.group(1))
         else:
             fallback_date = re.search(r'"uploadDate":"([^"]+)"', html_text) or re.search(r'"publishDate":"([^"]+)"', html_text)
-            if fallback_date: rec["posted_on"] = fallback_date.group(1)
+            if fallback_date: 
+                rec["posted_on"] = parse_relative_date(fallback_date.group(1))
 
         # 4. Precise Views
         v_match = re.search(r'<meta itemprop="interactionCount" content="(\d+)">', html_text)
@@ -495,7 +498,7 @@ def scrape_yt_deep_sync(ctx, tag, limit, status_container, fetch_shorts, fetch_v
                             "engagement": views or 0,
                             "creator": creator,
                             "thumbnail": thumb,
-                            "posted_on": parse_relative_date(raw_date) if raw_date else datetime.now(timezone.utc).isoformat(),
+                            "posted_on": parse_relative_date(raw_date),
                             "category": classify_category(f"{title} {clean_tag}"),
                             "scraped_at": datetime.now(timezone.utc).isoformat()
                         }
@@ -901,9 +904,11 @@ def render_grid(data, label, max_n=5000):
                 st.link_button(f"Open Link ↗", r.get("url", "#"), use_container_width=True)
 
 # ── TIME WINDOW TABS ──────────────────────────────────────────────────────────
+# Set timezone-aware now to match the UTC 'uploaded_at' column
 now = datetime.now(timezone.utc)
 ua = dff["uploaded_at"]
 
+# Perform robust timestamp comparison with exact boundaries
 d1  = dff[ua.notna() & (ua >= now - timedelta(days=1))]
 d7  = dff[ua.notna() & (ua >= now - timedelta(days=7))]
 d30 = dff[ua.notna() & (ua >= now - timedelta(days=30))]
