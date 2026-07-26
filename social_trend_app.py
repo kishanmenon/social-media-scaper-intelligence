@@ -1,12 +1,12 @@
 """
 social_trend_app.py
 Unified Social Trend Tracker Pro:
+- Deep Scroll Overhaul: Actively hunts YouTube's continuation spinner and smooth-scrolls to trigger infinite loads reliably.
+- Shorts Date Fix: Added regex fallbacks to pull hidden "uploadDate" and "publishDate" from ytInitialData.
 - Fixed Invalid Comparison Error: Aligned 'now' variable to UTC timezone to match the dataframe.
 - Fixed Timezone Error: Added utc=True to pandas to_datetime to prevent mixed timezone crashes.
 - YouTube Background Metadata Engine: Fetches exact Creator, Date, Views, and Likes directly from the video source code.
 - PERFECTED YT ENDPOINTS: Uses /hashtag/tag/shorts and /hashtag/tag/videos natively.
-- Deep Scroll Fix: Uses keyboard events to force YouTube's lazy-loader.
-- Fixed HTML tiles with no Markdown indentation bugs.
 - Strictly Independent Quotas for Reels, Shorts, and Videos.
 """
 import streamlit as st
@@ -236,9 +236,14 @@ def fetch_yt_metadata_requests(vid_id, target_type, clean_tag, yt_cookies_dict):
         c_match = re.search(r'<link itemprop="name" content="([^"]+)">', html_text)
         creator = html.unescape(c_match.group(1)) if c_match else ""
 
-        # 3. Exact Upload Date
+        # 3. Exact Upload Date (Fixed for Shorts)
         d_match = re.search(r'<meta itemprop="datePublished" content="([^"]+)">', html_text)
-        posted_on = d_match.group(1) if d_match else datetime.now(timezone.utc).isoformat()
+        if d_match:
+            posted_on = d_match.group(1)
+        else:
+            # Shorts hide their dates in the JSON payloads instead of meta tags
+            fallback_date = re.search(r'"uploadDate":"([^"]+)"', html_text) or re.search(r'"publishDate":"([^"]+)"', html_text)
+            posted_on = fallback_date.group(1) if fallback_date else datetime.now(timezone.utc).isoformat()
 
         # 4. Precise Views
         v_match = re.search(r'<meta itemprop="interactionCount" content="(\d+)">', html_text)
@@ -248,7 +253,7 @@ def fetch_yt_metadata_requests(vid_id, target_type, clean_tag, yt_cookies_dict):
             v_match2 = re.search(r'"viewCount":"(\d+)"', html_text)
             views = int(v_match2.group(1)) if v_match2 else 0
 
-        # 5. Precise Likes (Extracts from ytInitialData payload)
+        # 5. Precise Likes
         likes = 0
         l_match = re.search(r'"likeCount":"(\d+)"', html_text)
         if l_match:
@@ -300,7 +305,7 @@ def scrape_ig_deep_sync(ctx, tag, limit=50, status_container=None):
         main_el = page.locator("main")
         grid_scope = main_el if main_el.count() else page
 
-        max_scroll_attempts = max(20, limit)
+        max_scroll_attempts = max(60, int(limit * 1.5))
         no_new_items_count = 0
         
         for scroll_idx in range(max_scroll_attempts):
@@ -331,7 +336,7 @@ def scrape_ig_deep_sync(ctx, tag, limit=50, status_container=None):
             
             if len(seen_codes) == initial_count:
                 no_new_items_count += 1
-                if no_new_items_count >= 4: break
+                if no_new_items_count >= 8: break
             else:
                 no_new_items_count = 0
 
@@ -373,7 +378,6 @@ def scrape_yt_deep_sync(ctx, tag, limit, status_container, fetch_shorts, fetch_v
         collected_ids = []
         page = ctx.new_page()
         try:
-            # Step 1: Deep Scroll Feed to gather pure IDs
             if target_type == "Shorts":
                 target_url = f"https://www.youtube.com/hashtag/{clean_tag}/shorts"
             else:
@@ -382,14 +386,27 @@ def scrape_yt_deep_sync(ctx, tag, limit, status_container, fetch_shorts, fetch_v
             page.goto(target_url, wait_until="domcontentloaded", timeout=30000)
             time.sleep(3.0)
 
-            max_scrolls = max(40, limit)
+            # Massive scroll ceiling for deep quotas
+            max_scrolls = max(100, int(limit * 2))
             no_new_count = 0
             
             for scroll_idx in range(max_scrolls):
+                # HUMAN MIMICRY: Drag down viewport to intentionally trip the observer
+                page.keyboard.press("PageDown")
+                time.sleep(0.4)
+                page.keyboard.press("PageDown")
+                time.sleep(0.4)
                 page.keyboard.press("End")
-                time.sleep(0.5)
-                page.evaluate("window.scrollBy(0, 10000)")
-                time.sleep(2.5) 
+                time.sleep(1.5)
+                
+                # HUNT THE SPINNER: Find YouTube's lazy-load trigger and force it into view
+                try:
+                    spinner = page.locator("ytd-continuation-item-renderer").last
+                    if spinner.count() > 0:
+                        spinner.scroll_into_view_if_needed(timeout=1500)
+                except Exception: pass
+                
+                time.sleep(1.5) # Wait for network request to populate DOM
                 
                 vids = page.query_selector_all("a[href*='/shorts/'], a[href*='/watch']")
                 initial_count = len(collected_ids)
@@ -413,9 +430,10 @@ def scrape_yt_deep_sync(ctx, tag, limit, status_container, fetch_shorts, fetch_v
 
                 if len(collected_ids) >= limit: break
                 
+                # BULLETPROOF TIMEOUT: Only give up if NO new UNIQUE videos are found after 8 full cycles (~30 seconds of prodding)
                 if len(collected_ids) == initial_count:
                     no_new_count += 1
-                    if no_new_count >= 5: break
+                    if no_new_count >= 8: break
                 else:
                     no_new_count = 0
 
@@ -434,7 +452,7 @@ def scrape_yt_deep_sync(ctx, tag, limit, status_container, fetch_shorts, fetch_v
             meta = fetch_yt_metadata_requests(vid_id, target_type, clean_tag, yt_cookies_dict)
             if meta:
                 rows.append(meta)
-            time.sleep(0.1) # Soft pause to prevent rate limiting
+            time.sleep(0.1) 
             
         return rows
 
@@ -472,7 +490,6 @@ def execute_sync_scrape(hashtags, platforms, per_tag, status_box, progress_bar):
         if IG_SESSIONID: cks.append({"name": "sessionid", "value": IG_SESSIONID, "url": "https://www.instagram.com"})
         if IG_CSRFTOKEN: cks.append({"name": "csrftoken", "value": IG_CSRFTOKEN, "url": "https://www.instagram.com"})
         
-        # Build dictionary for the requests.get() background metadata fetcher
         yt_req_cookies = {}
         if YT_COOKIE:
             for c_item in YT_COOKIE.split(";"):
@@ -609,7 +626,7 @@ with st.sidebar:
                            default=st.session_state.sel_plats)
     if new_p != st.session_state.sel_plats: st.session_state.sel_plats = new_p
     
-    new_n = st.slider("Posts PER HASHTAG per content type", 10, 500, st.session_state.per_tag, step=10)
+    new_n = st.slider("Posts PER HASHTAG per content type", 10, 5000, st.session_state.per_tag, step=10)
     if new_n != st.session_state.per_tag: st.session_state.per_tag = new_n
     
     st.divider()
@@ -663,7 +680,6 @@ df = pd.DataFrame(all_data)
 df["engagement"] = pd.to_numeric(df.get("engagement", 0), errors="coerce").fillna(0)
 df["views"] = pd.to_numeric(df.get("views", None), errors="coerce")
 df["likes"] = pd.to_numeric(df.get("likes", None), errors="coerce")
-# Added utc=True to correctly handle mixed timezones from YouTube & IG
 df["uploaded_at"] = pd.to_datetime(df.get("posted_on", ""), errors="coerce", utc=True)
 
 # Exact Tag Normalization
@@ -722,7 +738,7 @@ def fv(v):
     if v >= 1_000: return f"{v/1_000:.0f}K"
     return str(v)
 
-def render_grid(data, label, max_n=500):
+def render_grid(data, label, max_n=5000):
     if data.empty: st.info("No posts found for this time window."); return
     d = apply_sort(data).head(max_n).reset_index(drop=True)
     st.caption(f"Displaying **{len(d)}** posts (Sorted by **{st.session_state.sort_mode}**).")
@@ -778,7 +794,6 @@ def render_grid(data, label, max_n=500):
                 st.link_button(f"Open Link ↗", r.get("url", "#"), use_container_width=True)
 
 # ── TIME WINDOW TABS ──────────────────────────────────────────────────────────
-# Use timezone-aware now to match the timezone-aware 'uploaded_at' column
 now = datetime.now(timezone.utc)
 ua = dff["uploaded_at"]
 
