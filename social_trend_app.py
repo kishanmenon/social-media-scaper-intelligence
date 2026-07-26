@@ -1,8 +1,9 @@
 """
 social_trend_app.py
 Unified Social Trend Tracker Pro:
+- INSTANT VIDEO PASS: Extracts long-form video metadata directly from the Search DOM (Zero HTTP overhead).
 - HYBRID YT ENDPOINTS: Uses /hashtag/tag/shorts for Shorts, and /results with video-only filter for unlimited Video depth.
-- GUARANTEED QUOTAS: Uses persistent requests.Session() and fallback dicts so blocked metadata requests never delete grid items.
+- GUARANTEED QUOTAS: Uses persistent requests.Session() and fallback dicts so blocked metadata requests never delete Shorts.
 - Deep Scroll Overhaul: Actively hunts YouTube's continuation spinner and smooth-scrolls to trigger infinite loads reliably.
 - Shorts Date Fix: Added regex fallbacks to pull hidden "uploadDate" and "publishDate" from ytInitialData.
 - Fixed Timezone Error: Aligned 'now' variable and pandas to_datetime to UTC.
@@ -114,6 +115,25 @@ def parse_num(s):
         n = float(m.group(1))
         return int(n * {"K":1000,"M":1_000_000,"B":1_000_000_000}.get(m.group(2),1))
     except Exception: return None
+
+def parse_relative_date(text: str) -> str:
+    if not text: return datetime.now(timezone.utc).isoformat()
+    text_clean = str(text).lower().strip()
+    m = re.search(r"(\d+)\s*(second|minute|hour|day|week|month|year)s?\s*ago", text_clean, re.I)
+    if m:
+        val = int(m.group(1))
+        unit = m.group(2).lower()
+        seconds_map = {
+            "second": 1, "minute": 60, "hour": 3600,
+            "day": 86400, "week": 604800, "month": 2592000, "year": 31536000
+        }
+        secs = val * seconds_map.get(unit, 86400)
+        return (datetime.now(timezone.utc) - timedelta(seconds=secs)).isoformat()
+    try:
+        dt = pd.to_datetime(text_clean, errors="coerce", utc=True)
+        if pd.notna(dt): return dt.isoformat()
+    except Exception: pass
+    return datetime.now(timezone.utc).isoformat()
 
 def fmt(domain, link):
     if not link: return ""
@@ -381,6 +401,8 @@ def scrape_yt_deep_sync(ctx, tag, limit, status_container, fetch_shorts, fetch_v
 
     def perform_yt_url_pass(target_type):
         collected_ids = []
+        collected_records = []  # Used exclusively for Zero-HTTP Video parsing
+        seen_ids = set()
         page = ctx.new_page()
         try:
             # HYBRID ENDPOINT LOGIC:
@@ -414,27 +436,94 @@ def scrape_yt_deep_sync(ctx, tag, limit, status_container, fetch_shorts, fetch_v
                 
                 time.sleep(1.5) 
                 
-                vids = page.query_selector_all("a[href*='/shorts/'], a[href*='/watch']")
+                # Fetch different DOM elements based on endpoint
+                if target_type == "Videos":
+                    vids = page.query_selector_all("ytd-video-renderer")
+                else:
+                    vids = page.query_selector_all("a[href*='/shorts/']")
+                    
                 current_dom_count = len(vids)
                 
-                for a in vids:
-                    href = a.get_attribute("href") or ""
-                    is_short = "/shorts/" in href
-                    
-                    if target_type == "Shorts" and not is_short: continue
-                    if target_type == "Videos" and is_short: continue
+                for v in vids:
+                    # ==========================================
+                    # INSTANT VIDEO METADATA PASS (DOM EXTRACTION)
+                    # ==========================================
+                    if target_type == "Videos":
+                        a = v.query_selector("a#video-title")
+                        if not a: continue
+                        href = a.get_attribute("href") or ""
+                        vid_m = re.search(r"v=([A-Za-z0-9_-]{11})", href)
+                        vid_id = vid_m.group(1) if vid_m else ""
+                        if not vid_id or vid_id in seen_ids: continue
+                        seen_ids.add(vid_id)
 
-                    vid_m = re.search(r"(?:v=|/shorts/)([A-Za-z0-9_-]{11})", href)
-                    vid_id = vid_m.group(1) if vid_m else ""
-                    if vid_id and vid_id not in collected_ids:
-                        collected_ids.append(vid_id)
+                        title = a.get_attribute("title") or a.inner_text().strip()
+                        c_el = v.query_selector(".ytd-channel-name a, #channel-name a")
+                        creator = c_el.inner_text().strip() if c_el else "YouTube User"
 
-                    if len(collected_ids) >= limit: break
+                        views = 0
+                        raw_date = ""
+                        spans = v.query_selector_all("#metadata-line span, .inline-metadata-item")
+                        for span in spans:
+                            txt = span.inner_text().strip()
+                            if "view" in txt.lower():
+                                vm = re.search(r'([\d,\.]+[KMB]?)\s*views?', txt, re.I)
+                                if vm: views = parse_num(vm.group(1))
+                            elif "ago" in txt.lower():
+                                raw_date = txt
+
+                        if not views or not raw_date:
+                            aria = a.get_attribute("aria-label") or ""
+                            vm = re.search(r'([\d,\.]+[KMB]?)\s*views?', aria, re.I)
+                            if vm and not views: views = parse_num(vm.group(1))
+                            dm = re.search(r'\d+\s*(?:second|minute|hour|day|week|month|year)s?\s*ago', aria, re.I)
+                            if dm and not raw_date: raw_date = dm.group(0)
+
+                        thumb = f"https://img.youtube.com/vi/{vid_id}/mqdefault.jpg"
+                        video_url = f"https://www.youtube.com/watch?v={vid_id}"
+
+                        rec = {
+                            "platform": "YouTube Videos",
+                            "content_type": "Video",
+                            "hashtag": f"#{clean_tag}",
+                            "title": title[:150] if title else f"#{clean_tag} Video",
+                            "description": "",
+                            "url": video_url,
+                            "views": views or 0,
+                            "likes": 0,
+                            "comments": None,
+                            "engagement": views or 0,
+                            "creator": creator,
+                            "thumbnail": thumb,
+                            "posted_on": parse_relative_date(raw_date) if raw_date else datetime.now(timezone.utc).isoformat(),
+                            "category": classify_category(f"{title} {clean_tag}"),
+                            "scraped_at": datetime.now(timezone.utc).isoformat()
+                        }
+                        collected_records.append(rec)
+                        
+                        if len(collected_records) >= limit: break
+
+                    # ==========================================
+                    # SHORTS ID COLLECTION PASS
+                    # ==========================================
+                    else:
+                        href = v.get_attribute("href") or ""
+                        is_short = "/shorts/" in href
+                        if not is_short: continue
+
+                        vid_m = re.search(r"/shorts/([A-Za-z0-9_-]{11})", href)
+                        vid_id = vid_m.group(1) if vid_m else ""
+                        if vid_id and vid_id not in collected_ids:
+                            collected_ids.append(vid_id)
+
+                        if len(collected_ids) >= limit: break
 
                 if status_container:
-                    status_container.info(f"▶️ YT #{clean_tag}: Discovered {target_type} IDs: {len(collected_ids)}/{limit}")
+                    count = len(collected_records) if target_type == "Videos" else len(collected_ids)
+                    status_container.info(f"▶️ YT #{clean_tag}: Discovered {target_type}: {count}/{limit}")
 
-                if len(collected_ids) >= limit: break
+                if target_type == "Videos" and len(collected_records) >= limit: break
+                if target_type == "Shorts" and len(collected_ids) >= limit: break
                 
                 if current_dom_count == previous_dom_count:
                     no_new_count += 1
@@ -449,8 +538,12 @@ def scrape_yt_deep_sync(ctx, tag, limit, status_container, fetch_shorts, fetch_v
         finally:
             try: page.close()
             except Exception: pass
+            
+        # FAST EXIT FOR VIDEOS: They are fully extracted, zero background HTTP loop needed!
+        if target_type == "Videos":
+            return collected_records
         
-        # Step 2: Set up a robust, persistent connection pool to survive rate limiting
+        # Step 2: Set up a robust, persistent connection pool to survive rate limiting (SHORTS ONLY)
         session = requests.Session()
         session.headers.update({
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
