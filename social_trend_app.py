@@ -1,11 +1,11 @@
 """
 social_trend_app.py
 Unified Social Trend Tracker Pro:
+- HYBRID YT ENDPOINTS: Uses /hashtag/tag/shorts for Shorts, and /results with video-only filter for unlimited Video depth.
 - GUARANTEED QUOTAS: Uses persistent requests.Session() and fallback dicts so blocked metadata requests never delete grid items.
 - Deep Scroll Overhaul: Actively hunts YouTube's continuation spinner and smooth-scrolls to trigger infinite loads reliably.
 - Shorts Date Fix: Added regex fallbacks to pull hidden "uploadDate" and "publishDate" from ytInitialData.
 - Fixed Timezone Error: Aligned 'now' variable and pandas to_datetime to UTC.
-- PERFECTED YT ENDPOINTS: Uses /hashtag/tag/shorts and /hashtag/tag/videos natively.
 - Strictly Independent Quotas for Reels, Shorts, and Videos.
 """
 import streamlit as st
@@ -374,7 +374,7 @@ def scrape_ig_deep_sync(ctx, tag, limit=50, status_container=None):
 
     return items_scraped
 
-# ── DEEP INFINITE SCROLL SCRAPER (YOUTUBE ALIGNED METADATA PASS) ──────────────
+# ── DEEP INFINITE SCROLL SCRAPER (YOUTUBE HYBRID ENDPOINTS) ───────────────────
 def scrape_yt_deep_sync(ctx, tag, limit, status_container, fetch_shorts, fetch_videos, yt_cookies_dict):
     clean_tag = tag.lower().strip("#")
     all_rows = []
@@ -383,10 +383,13 @@ def scrape_yt_deep_sync(ctx, tag, limit, status_container, fetch_shorts, fetch_v
         collected_ids = []
         page = ctx.new_page()
         try:
+            # HYBRID ENDPOINT LOGIC:
+            # Shorts natively support infinite scrolling on their hashtag sub-route
+            # Videos often break their DOM on the native hashtag route, so we use Search to guarantee depth.
             if target_type == "Shorts":
                 target_url = f"https://www.youtube.com/hashtag/{clean_tag}/shorts"
             else:
-                target_url = f"https://www.youtube.com/hashtag/{clean_tag}/videos?app=desktop"
+                target_url = f"https://www.youtube.com/results?search_query=%23{clean_tag}&sp=EgIQAQ%3D%3D"
 
             page.goto(target_url, wait_until="domcontentloaded", timeout=30000)
             time.sleep(3.0)
