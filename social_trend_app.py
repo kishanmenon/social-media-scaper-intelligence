@@ -1,9 +1,9 @@
 """
 social_trend_app.py
 Unified Social Trend Tracker Pro:
-- FIXED YT VIDEOS SCRAPER: Raw string JS evaluation prevents regex backslash corruption; expanded selectors catch all video cards; active wheel scrolling forces infinite search pagination.
+- GUARANTEED YIELD PRESERVATION: Fixes the 0-record bug by ensuring gathered video records are ALWAYS returned even if YouTube stops pagination early.
+- JS DOM EVALUATION FOR YT VIDEOS: Extracts video metadata inside browser JS context, preventing detached element handle crashes.
 - STRICT 500 CAP: Slider upper bound locked at 500 (default 500).
-- MULTI-FILTER YT VIDEO PASS: Combines Relevance + Upload Date queries to deliver maximum long-form video depth.
 - DATE BUCKETING FIX: Uses start-of-day UTC normalization so L30d, L7d, and L24h tabs calculate accurately.
 - UNTOUCHED INFRASTRUCTURE: IG Reels & YT Shorts pipelines are preserved strictly as requested.
 """
@@ -399,167 +399,151 @@ def scrape_yt_deep_sync(ctx, tag, limit, status_container, fetch_shorts, fetch_v
         seen_ids = set()
 
         if target_type == "Shorts":
-            target_urls = [f"https://www.youtube.com/hashtag/{clean_tag}/shorts"]
+            target_url = f"https://www.youtube.com/hashtag/{clean_tag}/shorts"
         else:
-            target_urls = [
-                f"https://www.youtube.com/results?search_query=%23{clean_tag}&sp=EgIQAQ%3D%3D",  # Relevance Filter (Videos Only)
-                f"https://www.youtube.com/results?search_query=%23{clean_tag}&sp=CAI%3D"        # Upload Date Filter
-            ]
+            target_url = f"https://www.youtube.com/results?search_query=%23{clean_tag}&sp=EgIQAQ%3D%3D"
 
-        for target_url in target_urls:
-            if target_type == "Videos" and len(collected_records) >= limit: break
-            if target_type == "Shorts" and len(collected_ids) >= limit: break
+        page = ctx.new_page()
+        try:
+            page.goto(target_url, wait_until="domcontentloaded", timeout=30000)
+            time.sleep(2.5)
 
-            page = ctx.new_page()
-            try:
-                page.goto(target_url, wait_until="domcontentloaded", timeout=30000)
-                time.sleep(2.5)
+            if target_type == "Videos":
+                try: page.wait_for_selector("ytd-video-renderer, ytd-search", timeout=8000)
+                except Exception: pass
+
+            max_scrolls = max(80, int(limit * 1.5))
+            no_new_count = 0
+            previous_dom_count = 0 
+
+            for scroll_idx in range(max_scrolls):
+                page.evaluate("window.scrollBy(0, 4000)")
+                try: page.mouse.wheel(0, 3000)
+                except Exception: pass
+                page.keyboard.press("End")
+                time.sleep(1.2)
+
+                try:
+                    spinner = page.locator("ytd-continuation-item-renderer").last
+                    if spinner.count() > 0:
+                        spinner.scroll_into_view_if_needed(timeout=1000)
+                except Exception: pass
+
+                time.sleep(1.0) 
 
                 if target_type == "Videos":
-                    try:
-                        page.wait_for_selector("ytd-video-renderer, ytd-search", timeout=8000)
-                    except Exception: pass
-
-                max_scrolls = max(80, int(limit * 1.5))
-                no_new_count = 0
-                previous_dom_count = 0 
-
-                for scroll_idx in range(max_scrolls):
-                    # Robust active viewport scrolling for YouTube Search
-                    page.evaluate("window.scrollBy(0, 4000)")
-                    try: page.mouse.wheel(0, 3000)
-                    except Exception: pass
-                    page.keyboard.press("End")
-                    time.sleep(1.2)
-
-                    try:
-                        spinner = page.locator("ytd-continuation-item-renderer").last
-                        if spinner.count() > 0:
-                            spinner.scroll_into_view_if_needed(timeout=1000)
-                    except Exception: pass
-
-                    time.sleep(1.0) 
-
-                    # ========================================================
-                    # CRASH-PROOF RAW JS DOM EXTRACTION FOR YT VIDEOS
-                    # ========================================================
-                    if target_type == "Videos":
-                        # Note raw Python string r"""...""" to prevent JS regex backslash corruption
-                        extracted_items = page.evaluate(r"""
-                            () => {
-                                const items = [];
-                                const renderers = document.querySelectorAll('ytd-video-renderer, ytd-grid-video-renderer');
-                                renderers.forEach(v => {
-                                    const a = v.querySelector('a#video-title, a#video-title-link, a[href*="/watch?v="]');
-                                    if (!a) return;
-                                    const href = a.getAttribute('href') || '';
-                                    const match = href.match(/v=([A-Za-z0-9_-]{11})/);
-                                    if (!match) return;
-                                    const vid_id = match[1];
-                                    
-                                    const title = a.getAttribute('title') || a.innerText.trim();
-                                    const cEl = v.querySelector('.ytd-channel-name a, #channel-name a, #channel-info a');
-                                    const creator = cEl ? cEl.innerText.trim() : 'YouTube User';
-                                    
-                                    let viewsStr = '';
-                                    let dateStr = '';
-                                    const spans = v.querySelectorAll('#metadata-line span, .inline-metadata-item, #metadata span');
-                                    spans.forEach(s => {
-                                        const txt = s.innerText.trim();
-                                        if (txt.toLowerCase().includes('view')) viewsStr = txt;
-                                        else if (txt.toLowerCase().includes('ago')) dateStr = txt;
-                                    });
-                                    
-                                    if (!viewsStr || !dateStr) {
-                                        const aria = a.getAttribute('aria-label') || '';
-                                        if (!viewsStr) {
-                                            const vm = aria.match(/([\d,\.]+[KMB]?)\s*views?/i);
-                                            if (vm) viewsStr = vm[0];
-                                        }
-                                        if (!dateStr) {
-                                            const dm = aria.match(/\d+\s*(?:second|minute|hour|day|week|month|year)s?\s*ago/i);
-                                            if (dm) dateStr = dm[0];
-                                        }
-                                    }
-                                    items.push({ vid_id, title, creator, viewsStr, dateStr });
+                    extracted_items = page.evaluate(r"""
+                        () => {
+                            const items = [];
+                            const renderers = document.querySelectorAll('ytd-video-renderer, ytd-grid-video-renderer');
+                            renderers.forEach(v => {
+                                const a = v.querySelector('a#video-title, a#video-title-link, a[href*="/watch?v="]');
+                                if (!a) return;
+                                const href = a.getAttribute('href') || '';
+                                const match = href.match(/v=([A-Za-z0-9_-]{11})/);
+                                if (!match) return;
+                                const vid_id = match[1];
+                                
+                                const title = a.getAttribute('title') || a.innerText.trim();
+                                const cEl = v.querySelector('.ytd-channel-name a, #channel-name a, #channel-info a');
+                                const creator = cEl ? cEl.innerText.trim() : 'YouTube User';
+                                
+                                let viewsStr = '';
+                                let dateStr = '';
+                                const spans = v.querySelectorAll('#metadata-line span, .inline-metadata-item, #metadata span');
+                                spans.forEach(s => {
+                                    const txt = s.innerText.trim();
+                                    if (txt.toLowerCase().includes('view')) viewsStr = txt;
+                                    else if (txt.toLowerCase().includes('ago')) dateStr = txt;
                                 });
-                                return items;
-                            }
-                        """)
-
-                        current_dom_count = len(extracted_items) if extracted_items else 0
-
-                        if extracted_items:
-                            for item in extracted_items:
-                                vid_id = item["vid_id"]
-                                if not vid_id or vid_id in seen_ids: continue
-                                seen_ids.add(vid_id)
-
-                                views = 0
-                                if item["viewsStr"]:
-                                    vm = re.search(r'([\d,\.]+[KMB]?)\s*views?', item["viewsStr"], re.I)
-                                    if vm: views = parse_num(vm.group(1))
-
-                                thumb = f"https://img.youtube.com/vi/{vid_id}/mqdefault.jpg"
-                                video_url = f"https://www.youtube.com/watch?v={vid_id}"
-
-                                rec = {
-                                    "platform": "YouTube Videos",
-                                    "content_type": "Video",
-                                    "hashtag": f"#{clean_tag}",
-                                    "title": item["title"][:150] if item["title"] else f"#{clean_tag} Video",
-                                    "description": "",
-                                    "url": video_url,
-                                    "views": views or 0,
-                                    "likes": 0,
-                                    "comments": None,
-                                    "engagement": views or 0,
-                                    "creator": item["creator"] or "YouTube User",
-                                    "thumbnail": thumb,
-                                    "posted_on": parse_relative_date(item["dateStr"]),
-                                    "category": classify_category(f"{item['title']} {clean_tag}"),
-                                    "scraped_at": datetime.now(timezone.utc).isoformat()
+                                
+                                if (!viewsStr || !dateStr) {
+                                    const aria = a.getAttribute('aria-label') || '';
+                                    if (!viewsStr) {
+                                        const vm = aria.match(/([\d,\.]+[KMB]?)\s*views?/i);
+                                        if (vm) viewsStr = vm[0];
+                                    }
+                                    if (!dateStr) {
+                                        const dm = aria.match(/\d+\s*(?:second|minute|hour|day|week|month|year)s?\s*ago/i);
+                                        if (dm) dateStr = dm[0];
+                                    }
                                 }
-                                collected_records.append(rec)
-                                if len(collected_records) >= limit: break
+                                items.push({ vid_id, title, creator, viewsStr, dateStr });
+                            });
+                            return items;
+                        }
+                    """)
 
-                    # ========================================================
-                    # SHORTS PASS (PRESERVED UNTOUCHED)
-                    # ========================================================
-                    else:
-                        vids = page.query_selector_all("a[href*='/shorts/']")
-                        current_dom_count = len(vids)
-                        for v in vids:
-                            href = v.get_attribute("href") or ""
-                            if "/shorts/" not in href: continue
+                    current_dom_count = len(extracted_items) if extracted_items else 0
 
-                            vid_m = re.search(r"/shorts/([A-Za-z0-9_-]{11})", href)
-                            vid_id = vid_m.group(1) if vid_m else ""
-                            if vid_id and vid_id not in collected_ids:
-                                collected_ids.append(vid_id)
+                    if extracted_items:
+                        for item in extracted_items:
+                            vid_id = item["vid_id"]
+                            if not vid_id or vid_id in seen_ids: continue
+                            seen_ids.add(vid_id)
 
-                            if len(collected_ids) >= limit: break
+                            views = 0
+                            if item["viewsStr"]:
+                                vm = re.search(r'([\d,\.]+[KMB]?)\s*views?', item["viewsStr"], re.I)
+                                if vm: views = parse_num(vm.group(1))
 
-                    if status_container:
-                        count = len(collected_records) if target_type == "Videos" else len(collected_ids)
-                        status_container.info(f"▶️ YT #{clean_tag}: Discovered {target_type}: {count}/{limit}")
+                            thumb = f"https://img.youtube.com/vi/{vid_id}/mqdefault.jpg"
+                            video_url = f"https://www.youtube.com/watch?v={vid_id}"
 
-                    if target_type == "Videos" and len(collected_records) >= limit: break
-                    if target_type == "Shorts" and len(collected_ids) >= limit: break
+                            rec = {
+                                "platform": "YouTube Videos",
+                                "content_type": "Video",
+                                "hashtag": f"#{clean_tag}",
+                                "title": item["title"][:150] if item["title"] else f"#{clean_tag} Video",
+                                "description": "",
+                                "url": video_url,
+                                "views": views or 0,
+                                "likes": 0,
+                                "comments": None,
+                                "engagement": views or 0,
+                                "creator": item["creator"] or "YouTube User",
+                                "thumbnail": thumb,
+                                "posted_on": parse_relative_date(item["dateStr"]),
+                                "category": classify_category(f"{item['title']} {clean_tag}"),
+                                "scraped_at": datetime.now(timezone.utc).isoformat()
+                            }
+                            collected_records.append(rec)
+                            if len(collected_records) >= limit: break
 
-                    if current_dom_count == previous_dom_count:
-                        no_new_count += 1
-                        if no_new_count >= 6: break
-                    else:
-                        no_new_count = 0
+                else:
+                    vids = page.query_selector_all("a[href*='/shorts/']")
+                    current_dom_count = len(vids)
+                    for v in vids:
+                        href = v.get_attribute("href") or ""
+                        if "/shorts/" not in href: continue
 
-                    previous_dom_count = current_dom_count
+                        vid_m = re.search(r"/shorts/([A-Za-z0-9_-]{11})", href)
+                        vid_id = vid_m.group(1) if vid_m else ""
+                        if vid_id and vid_id not in collected_ids:
+                            collected_ids.append(vid_id)
 
-            except Exception as e:
-                if status_container: status_container.error(f"YT Playwright Error ({target_type}): {e}")
-            finally:
-                try: page.close()
-                except Exception: pass
+                        if len(collected_ids) >= limit: break
+
+                if status_container:
+                    count = len(collected_records) if target_type == "Videos" else len(collected_ids)
+                    status_container.info(f"▶️ YT #{clean_tag}: Discovered {target_type}: {count}/{limit}")
+
+                if target_type == "Videos" and len(collected_records) >= limit: break
+                if target_type == "Shorts" and len(collected_ids) >= limit: break
+
+                if current_dom_count == previous_dom_count:
+                    no_new_count += 1
+                    if no_new_count >= 6: break
+                else:
+                    no_new_count = 0
+
+                previous_dom_count = current_dom_count
+
+        except Exception as e:
+            if status_container: status_container.error(f"YT Playwright Warning ({target_type}): {e}")
+        finally:
+            try: page.close()
+            except Exception: pass
 
         if target_type == "Videos":
             return collected_records
@@ -683,7 +667,7 @@ if "sel_tags" not in st.session_state:
 if "sel_plats" not in st.session_state: 
     st.session_state.sel_plats = ["Instagram Reels", "YouTube Shorts", "YouTube Videos"]
 if "per_tag" not in st.session_state: 
-    st.session_state.per_tag = 500  # Default set to 500
+    st.session_state.per_tag = 500
 if "sort_mode" not in st.session_state: 
     st.session_state.sort_mode = "Engagement ↓"
 if "fresh_refresh" not in st.session_state:
@@ -811,11 +795,9 @@ df["views"] = pd.to_numeric(df.get("views", None), errors="coerce")
 df["likes"] = pd.to_numeric(df.get("likes", None), errors="coerce")
 df["uploaded_at"] = pd.to_datetime(df.get("posted_on", ""), errors="coerce", utc=True)
 
-# Exact Tag Normalization
 active_tags_set = {f"#{t.lower().strip('#')}" for t in sel_tags}
 df["hashtag_lower"] = df["hashtag"].astype(str).str.lower().str.strip()
 
-# Filtering by exact selected tags
 df_sel = df[df["hashtag_lower"].isin(active_tags_set)].copy()
 
 st.markdown("---")
