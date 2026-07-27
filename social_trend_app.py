@@ -1,11 +1,11 @@
 """
 social_trend_app.py
 Unified Social Trend Tracker Pro:
+- JS DOM EVALUATION FIX FOR YT VIDEOS: Extracts video metadata inside browser JS context, preventing detached element handle crashes.
 - STRICT 500 CAP: Slider upper bound locked at 500 (default 500).
-- MULTI-FILTER YT VIDEO PASS: Solves the ~300 YouTube video search limit by dynamically combining Relevance + Upload Date queries to deliver full 500 video depth.
+- MULTI-FILTER YT VIDEO PASS: Combines Relevance + Upload Date queries to deliver maximum long-form video depth.
 - DATE BUCKETING FIX: Uses start-of-day UTC normalization so L30d, L7d, and L24h tabs calculate accurately without time-of-day offset drops.
-- GUARANTEED QUOTAS: Uses persistent requests.Session() and fallback dicts so metadata errors never drop grid items.
-- Deep Scroll Overhaul: Smooth scrolling + loading spinner detection for maximum pagination yield.
+- UNTOUCHED INFRASTRUCTURE: IG Reels & YT Shorts pipelines are preserved strictly as requested.
 """
 import streamlit as st
 import os, re, json, gc, time, io, subprocess, sys, html
@@ -398,13 +398,12 @@ def scrape_yt_deep_sync(ctx, tag, limit, status_container, fetch_shorts, fetch_v
         collected_records = []
         seen_ids = set()
 
-        # Multi-query route fallback list to ensure YT Videos can pass the 300 search ceiling and hit up to 500!
         if target_type == "Shorts":
             target_urls = [f"https://www.youtube.com/hashtag/{clean_tag}/shorts"]
         else:
             target_urls = [
                 f"https://www.youtube.com/results?search_query=%23{clean_tag}&sp=EgIQAQ%3D%3D",  # Relevance Filter
-                f"https://www.youtube.com/results?search_query=%23{clean_tag}&sp=CAI%253D"       # Upload Date Filter
+                f"https://www.youtube.com/results?search_query=%23{clean_tag}&sp=CAI%3D"        # Upload Date Filter
             ]
 
         for target_url in target_urls:
@@ -436,44 +435,63 @@ def scrape_yt_deep_sync(ctx, tag, limit, status_container, fetch_shorts, fetch_v
 
                     time.sleep(1.2) 
 
+                    # ========================================================
+                    # CRASH-PROOF BROWSER-SIDE JS DOM EXTRACTION FOR YT VIDEOS
+                    # ========================================================
                     if target_type == "Videos":
-                        vids = page.query_selector_all("ytd-video-renderer")
-                    else:
-                        vids = page.query_selector_all("a[href*='/shorts/']")
+                        extracted_items = page.evaluate("""
+                            () => {
+                                const items = [];
+                                const renderers = document.querySelectorAll('ytd-video-renderer');
+                                renderers.forEach(v => {
+                                    const a = v.querySelector('a#video-title');
+                                    if (!a) return;
+                                    const href = a.getAttribute('href') || '';
+                                    const match = href.match(/v=([A-Za-z0-9_-]{11})/);
+                                    if (!match) return;
+                                    const vid_id = match[1];
+                                    
+                                    const title = a.getAttribute('title') || a.innerText.trim();
+                                    const cEl = v.querySelector('.ytd-channel-name a, #channel-name a');
+                                    const creator = cEl ? cEl.innerText.trim() : 'YouTube User';
+                                    
+                                    let viewsStr = '';
+                                    let dateStr = '';
+                                    const spans = v.querySelectorAll('#metadata-line span, .inline-metadata-item');
+                                    spans.forEach(s => {
+                                        const txt = s.innerText.trim();
+                                        if (txt.toLowerCase().includes('view')) viewsStr = txt;
+                                        else if (txt.toLowerCase().includes('ago')) dateStr = txt;
+                                    });
+                                    
+                                    if (!viewsStr || !dateStr) {
+                                        const aria = a.getAttribute('aria-label') || '';
+                                        if (!viewsStr) {
+                                            const vm = aria.match(/([\\d,\\.]+[KMB]?)\\s*views?/i);
+                                            if (vm) viewsStr = vm[0];
+                                        }
+                                        if (!dateStr) {
+                                            const dm = aria.match(/\\d+\\s*(?:second|minute|hour|day|week|month|year)s?\\s*ago/i);
+                                            if (dm) dateStr = dm[0];
+                                        }
+                                    }
+                                    items.push({ vid_id, title, creator, viewsStr, dateStr });
+                                });
+                                return items;
+                            }
+                        """)
 
-                    current_dom_count = len(vids)
+                        current_dom_count = len(extracted_items)
 
-                    for v in vids:
-                        if target_type == "Videos":
-                            a = v.query_selector("a#video-title")
-                            if not a: continue
-                            href = a.get_attribute("href") or ""
-                            vid_m = re.search(r"v=([A-Za-z0-9_-]{11})", href)
-                            vid_id = vid_m.group(1) if vid_m else ""
+                        for item in extracted_items:
+                            vid_id = item["vid_id"]
                             if not vid_id or vid_id in seen_ids: continue
                             seen_ids.add(vid_id)
 
-                            title = a.get_attribute("title") or a.inner_text().strip()
-                            c_el = v.query_selector(".ytd-channel-name a, #channel-name a")
-                            creator = c_el.inner_text().strip() if c_el else "YouTube User"
-
                             views = 0
-                            raw_date = ""
-                            spans = v.query_selector_all("#metadata-line span, .inline-metadata-item")
-                            for span in spans:
-                                txt = span.inner_text().strip()
-                                if "view" in txt.lower():
-                                    vm = re.search(r'([\d,\.]+[KMB]?)\s*views?', txt, re.I)
-                                    if vm: views = parse_num(vm.group(1))
-                                elif "ago" in txt.lower():
-                                    raw_date = txt
-
-                            if not views or not raw_date:
-                                aria = a.get_attribute("aria-label") or ""
-                                vm = re.search(r'([\d,\.]+[KMB]?)\s*views?', aria, re.I)
-                                if vm and not views: views = parse_num(vm.group(1))
-                                dm = re.search(r'\d+\s*(?:second|minute|hour|day|week|month|year)s?\s*ago', aria, re.I)
-                                if dm and not raw_date: raw_date = dm.group(0)
+                            if item["viewsStr"]:
+                                vm = re.search(r'([\d,\.]+[KMB]?)\s*views?', item["viewsStr"], re.I)
+                                if vm: views = parse_num(vm.group(1))
 
                             thumb = f"https://img.youtube.com/vi/{vid_id}/mqdefault.jpg"
                             video_url = f"https://www.youtube.com/watch?v={vid_id}"
@@ -482,27 +500,31 @@ def scrape_yt_deep_sync(ctx, tag, limit, status_container, fetch_shorts, fetch_v
                                 "platform": "YouTube Videos",
                                 "content_type": "Video",
                                 "hashtag": f"#{clean_tag}",
-                                "title": title[:150] if title else f"#{clean_tag} Video",
+                                "title": item["title"][:150] if item["title"] else f"#{clean_tag} Video",
                                 "description": "",
                                 "url": video_url,
                                 "views": views or 0,
                                 "likes": 0,
                                 "comments": None,
                                 "engagement": views or 0,
-                                "creator": creator,
+                                "creator": item["creator"] or "YouTube User",
                                 "thumbnail": thumb,
-                                "posted_on": parse_relative_date(raw_date),
-                                "category": classify_category(f"{title} {clean_tag}"),
+                                "posted_on": parse_relative_date(item["dateStr"]),
+                                "category": classify_category(f"{item['title']} {clean_tag}"),
                                 "scraped_at": datetime.now(timezone.utc).isoformat()
                             }
                             collected_records.append(rec)
-
                             if len(collected_records) >= limit: break
 
-                        else:
+                    # ========================================================
+                    # SHORTS PASS (PRESERVED UNTOUCHED)
+                    # ========================================================
+                    else:
+                        vids = page.query_selector_all("a[href*='/shorts/']")
+                        current_dom_count = len(vids)
+                        for v in vids:
                             href = v.get_attribute("href") or ""
-                            is_short = "/shorts/" in href
-                            if not is_short: continue
+                            if "/shorts/" not in href: continue
 
                             vid_m = re.search(r"/shorts/([A-Za-z0-9_-]{11})", href)
                             vid_id = vid_m.group(1) if vid_m else ""
@@ -535,7 +557,7 @@ def scrape_yt_deep_sync(ctx, tag, limit, status_container, fetch_shorts, fetch_v
         if target_type == "Videos":
             return collected_records
 
-        # Step 2: Session metadata pass for YouTube Shorts
+        # Step 2: Session metadata pass for YouTube Shorts (UNTOUCHED)
         session = requests.Session()
         session.headers.update({
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
