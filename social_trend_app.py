@@ -1,10 +1,10 @@
 """
 social_trend_app.py
 Unified Social Trend Tracker Pro:
-- JS DOM EVALUATION FIX FOR YT VIDEOS: Extracts video metadata inside browser JS context, preventing detached element handle crashes.
+- FIXED YT VIDEOS SCRAPER: Raw string JS evaluation prevents regex backslash corruption; expanded selectors catch all video cards; active wheel scrolling forces infinite search pagination.
 - STRICT 500 CAP: Slider upper bound locked at 500 (default 500).
 - MULTI-FILTER YT VIDEO PASS: Combines Relevance + Upload Date queries to deliver maximum long-form video depth.
-- DATE BUCKETING FIX: Uses start-of-day UTC normalization so L30d, L7d, and L24h tabs calculate accurately without time-of-day offset drops.
+- DATE BUCKETING FIX: Uses start-of-day UTC normalization so L30d, L7d, and L24h tabs calculate accurately.
 - UNTOUCHED INFRASTRUCTURE: IG Reels & YT Shorts pipelines are preserved strictly as requested.
 """
 import streamlit as st
@@ -402,7 +402,7 @@ def scrape_yt_deep_sync(ctx, tag, limit, status_container, fetch_shorts, fetch_v
             target_urls = [f"https://www.youtube.com/hashtag/{clean_tag}/shorts"]
         else:
             target_urls = [
-                f"https://www.youtube.com/results?search_query=%23{clean_tag}&sp=EgIQAQ%3D%3D",  # Relevance Filter
+                f"https://www.youtube.com/results?search_query=%23{clean_tag}&sp=EgIQAQ%3D%3D",  # Relevance Filter (Videos Only)
                 f"https://www.youtube.com/results?search_query=%23{clean_tag}&sp=CAI%3D"        # Upload Date Filter
             ]
 
@@ -413,38 +413,44 @@ def scrape_yt_deep_sync(ctx, tag, limit, status_container, fetch_shorts, fetch_v
             page = ctx.new_page()
             try:
                 page.goto(target_url, wait_until="domcontentloaded", timeout=30000)
-                time.sleep(3.0)
+                time.sleep(2.5)
+
+                if target_type == "Videos":
+                    try:
+                        page.wait_for_selector("ytd-video-renderer, ytd-search", timeout=8000)
+                    except Exception: pass
 
                 max_scrolls = max(80, int(limit * 1.5))
                 no_new_count = 0
                 previous_dom_count = 0 
 
                 for scroll_idx in range(max_scrolls):
-                    page.keyboard.press("PageDown")
-                    time.sleep(0.3)
-                    page.keyboard.press("PageDown")
-                    time.sleep(0.3)
+                    # Robust active viewport scrolling for YouTube Search
+                    page.evaluate("window.scrollBy(0, 4000)")
+                    try: page.mouse.wheel(0, 3000)
+                    except Exception: pass
                     page.keyboard.press("End")
                     time.sleep(1.2)
 
                     try:
                         spinner = page.locator("ytd-continuation-item-renderer").last
                         if spinner.count() > 0:
-                            spinner.scroll_into_view_if_needed(timeout=1200)
+                            spinner.scroll_into_view_if_needed(timeout=1000)
                     except Exception: pass
 
-                    time.sleep(1.2) 
+                    time.sleep(1.0) 
 
                     # ========================================================
-                    # CRASH-PROOF BROWSER-SIDE JS DOM EXTRACTION FOR YT VIDEOS
+                    # CRASH-PROOF RAW JS DOM EXTRACTION FOR YT VIDEOS
                     # ========================================================
                     if target_type == "Videos":
-                        extracted_items = page.evaluate("""
+                        # Note raw Python string r"""...""" to prevent JS regex backslash corruption
+                        extracted_items = page.evaluate(r"""
                             () => {
                                 const items = [];
-                                const renderers = document.querySelectorAll('ytd-video-renderer');
+                                const renderers = document.querySelectorAll('ytd-video-renderer, ytd-grid-video-renderer');
                                 renderers.forEach(v => {
-                                    const a = v.querySelector('a#video-title');
+                                    const a = v.querySelector('a#video-title, a#video-title-link, a[href*="/watch?v="]');
                                     if (!a) return;
                                     const href = a.getAttribute('href') || '';
                                     const match = href.match(/v=([A-Za-z0-9_-]{11})/);
@@ -452,12 +458,12 @@ def scrape_yt_deep_sync(ctx, tag, limit, status_container, fetch_shorts, fetch_v
                                     const vid_id = match[1];
                                     
                                     const title = a.getAttribute('title') || a.innerText.trim();
-                                    const cEl = v.querySelector('.ytd-channel-name a, #channel-name a');
+                                    const cEl = v.querySelector('.ytd-channel-name a, #channel-name a, #channel-info a');
                                     const creator = cEl ? cEl.innerText.trim() : 'YouTube User';
                                     
                                     let viewsStr = '';
                                     let dateStr = '';
-                                    const spans = v.querySelectorAll('#metadata-line span, .inline-metadata-item');
+                                    const spans = v.querySelectorAll('#metadata-line span, .inline-metadata-item, #metadata span');
                                     spans.forEach(s => {
                                         const txt = s.innerText.trim();
                                         if (txt.toLowerCase().includes('view')) viewsStr = txt;
@@ -467,11 +473,11 @@ def scrape_yt_deep_sync(ctx, tag, limit, status_container, fetch_shorts, fetch_v
                                     if (!viewsStr || !dateStr) {
                                         const aria = a.getAttribute('aria-label') || '';
                                         if (!viewsStr) {
-                                            const vm = aria.match(/([\\d,\\.]+[KMB]?)\\s*views?/i);
+                                            const vm = aria.match(/([\d,\.]+[KMB]?)\s*views?/i);
                                             if (vm) viewsStr = vm[0];
                                         }
                                         if (!dateStr) {
-                                            const dm = aria.match(/\\d+\\s*(?:second|minute|hour|day|week|month|year)s?\\s*ago/i);
+                                            const dm = aria.match(/\d+\s*(?:second|minute|hour|day|week|month|year)s?\s*ago/i);
                                             if (dm) dateStr = dm[0];
                                         }
                                     }
@@ -481,40 +487,41 @@ def scrape_yt_deep_sync(ctx, tag, limit, status_container, fetch_shorts, fetch_v
                             }
                         """)
 
-                        current_dom_count = len(extracted_items)
+                        current_dom_count = len(extracted_items) if extracted_items else 0
 
-                        for item in extracted_items:
-                            vid_id = item["vid_id"]
-                            if not vid_id or vid_id in seen_ids: continue
-                            seen_ids.add(vid_id)
+                        if extracted_items:
+                            for item in extracted_items:
+                                vid_id = item["vid_id"]
+                                if not vid_id or vid_id in seen_ids: continue
+                                seen_ids.add(vid_id)
 
-                            views = 0
-                            if item["viewsStr"]:
-                                vm = re.search(r'([\d,\.]+[KMB]?)\s*views?', item["viewsStr"], re.I)
-                                if vm: views = parse_num(vm.group(1))
+                                views = 0
+                                if item["viewsStr"]:
+                                    vm = re.search(r'([\d,\.]+[KMB]?)\s*views?', item["viewsStr"], re.I)
+                                    if vm: views = parse_num(vm.group(1))
 
-                            thumb = f"https://img.youtube.com/vi/{vid_id}/mqdefault.jpg"
-                            video_url = f"https://www.youtube.com/watch?v={vid_id}"
+                                thumb = f"https://img.youtube.com/vi/{vid_id}/mqdefault.jpg"
+                                video_url = f"https://www.youtube.com/watch?v={vid_id}"
 
-                            rec = {
-                                "platform": "YouTube Videos",
-                                "content_type": "Video",
-                                "hashtag": f"#{clean_tag}",
-                                "title": item["title"][:150] if item["title"] else f"#{clean_tag} Video",
-                                "description": "",
-                                "url": video_url,
-                                "views": views or 0,
-                                "likes": 0,
-                                "comments": None,
-                                "engagement": views or 0,
-                                "creator": item["creator"] or "YouTube User",
-                                "thumbnail": thumb,
-                                "posted_on": parse_relative_date(item["dateStr"]),
-                                "category": classify_category(f"{item['title']} {clean_tag}"),
-                                "scraped_at": datetime.now(timezone.utc).isoformat()
-                            }
-                            collected_records.append(rec)
-                            if len(collected_records) >= limit: break
+                                rec = {
+                                    "platform": "YouTube Videos",
+                                    "content_type": "Video",
+                                    "hashtag": f"#{clean_tag}",
+                                    "title": item["title"][:150] if item["title"] else f"#{clean_tag} Video",
+                                    "description": "",
+                                    "url": video_url,
+                                    "views": views or 0,
+                                    "likes": 0,
+                                    "comments": None,
+                                    "engagement": views or 0,
+                                    "creator": item["creator"] or "YouTube User",
+                                    "thumbnail": thumb,
+                                    "posted_on": parse_relative_date(item["dateStr"]),
+                                    "category": classify_category(f"{item['title']} {clean_tag}"),
+                                    "scraped_at": datetime.now(timezone.utc).isoformat()
+                                }
+                                collected_records.append(rec)
+                                if len(collected_records) >= limit: break
 
                     # ========================================================
                     # SHORTS PASS (PRESERVED UNTOUCHED)
@@ -915,7 +922,6 @@ def render_grid(data, label, max_n=500):
 
 # ── TIME WINDOW TABS (DATE BUCKETING FIXED) ───────────────────────────────────
 now = datetime.now(timezone.utc)
-# Start of today UTC ensures calendar-day boundaries calculate cleanly
 today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
 
 ua = dff["uploaded_at"]
